@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               RiskManager.mqh   |
-//|              Risk Management for SMC Scalper EA v6.0            |
+//|              Risk Management for SMC Scalper EA v6.1            |
 //|                                                                  |
-//|  Philosophy: ONE hard daily loss cap. No pausing. No complex    |
-//|  drawdown tracking. Let the strategy trade freely within the    |
-//|  daily risk budget. Gentle size reduction after losing streaks. |
+//|  v6.1: No emergency stop killing trades. Daily loss cap only    |
+//|  blocks NEW trades. Open trades run to their SL/TP naturally.   |
+//|  Lot sizing refuses to trade if min lot exceeds risk budget.    |
 //+------------------------------------------------------------------+
 #ifndef RISKMANAGER_MQH
 #define RISKMANAGER_MQH
@@ -16,14 +16,13 @@ private:
    SRiskParams    m_params;
    SStreakControl m_streak;
    double         m_dayStartBalance;
-   double         m_dayPnL;
+   double         m_realizedPnL;
    datetime       m_currentDay;
    int            m_tradesToday;
    int            m_tradesOpened;
    bool           m_dailyTargetHit;
    bool           m_dailyLossHit;
    bool           m_ignoreDailyTarget;
-   bool           m_emergencyStop;
 
    datetime GetGMTDate() {
       MqlDateTime dt;
@@ -32,17 +31,23 @@ private:
       return StructToTime(dt);
    }
 
+   datetime GetServerDate() {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      dt.hour = 0; dt.min = 0; dt.sec = 0;
+      return StructToTime(dt);
+   }
+
    void CheckNewDay() {
-      datetime today = GetGMTDate();
+      datetime today = GetServerDate();
       if(today != m_currentDay) {
          m_currentDay      = today;
          m_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-         m_dayPnL          = 0;
+         m_realizedPnL     = 0;
          m_tradesToday     = 0;
          m_tradesOpened    = 0;
          m_dailyTargetHit  = false;
          m_dailyLossHit    = false;
-         m_emergencyStop   = false;
          m_streak.consecutiveLosses = 0;
          m_streak.consecutiveWins   = 0;
          m_streak.sizeMult          = 1.0;
@@ -67,72 +72,40 @@ public:
       m_streak.sizeMult = 1.0;
 
       m_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-      m_dayPnL          = 0;
+      m_realizedPnL     = 0;
       m_tradesToday     = 0;
       m_tradesOpened    = 0;
       m_dailyTargetHit  = false;
       m_dailyLossHit    = false;
-      m_emergencyStop   = false;
-      m_currentDay      = GetGMTDate();
+      m_currentDay      = GetServerDate();
    }
 
    void Update() {
       CheckNewDay();
-      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      m_dayPnL = equity - m_dayStartBalance;
 
-      double pct = 0;
+      double realPct = 0;
       if(m_dayStartBalance > 0)
-         pct = (m_dayPnL / m_dayStartBalance) * 100.0;
+         realPct = (m_realizedPnL / m_dayStartBalance) * 100.0;
 
-      if(!m_dailyTargetHit && pct >= m_params.maxDailyProfitPct) {
+      if(!m_dailyTargetHit && realPct >= m_params.maxDailyProfitPct) {
          m_dailyTargetHit = true;
-         Print("[Risk] DAILY TARGET HIT +", DoubleToString(pct, 1),
-               "% ($", DoubleToString(m_dayPnL, 2), ")");
+         Print("[Risk] DAILY TARGET HIT +", DoubleToString(realPct, 1),
+               "% ($", DoubleToString(m_realizedPnL, 2), ")");
       }
-      if(!m_dailyLossHit && pct <= -(m_params.maxDailyLossPct)) {
+      if(!m_dailyLossHit && realPct <= -(m_params.maxDailyLossPct)) {
          m_dailyLossHit = true;
-         Print("[Risk] DAILY LOSS LIMIT ", DoubleToString(pct, 1),
-               "% ($", DoubleToString(m_dayPnL, 2), ")");
+         Print("[Risk] DAILY LOSS LIMIT ", DoubleToString(realPct, 1),
+               "% ($", DoubleToString(m_realizedPnL, 2), ")");
       }
-   }
-
-   //==========================================================
-   // EMERGENCY STOP: checked every tick
-   // Triggers when equity drops >= maxDailyLoss% from DAY START
-   // (not from some arbitrary peak)
-   //==========================================================
-   bool CheckEmergencyStop() {
-      if(m_emergencyStop) return true;
-      CheckNewDay();
-
-      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      if(m_dayStartBalance <= 0) return false;
-
-      double lossPct = ((m_dayStartBalance - equity) / m_dayStartBalance) * 100.0;
-      if(lossPct >= m_params.maxDailyLossPct) {
-         m_emergencyStop = true;
-         m_dailyLossHit  = true;
-         Print("[Risk] === EMERGENCY STOP === Equity $",
-               DoubleToString(equity, 2), " down ",
-               DoubleToString(lossPct, 1), "% from day start $",
-               DoubleToString(m_dayStartBalance, 2));
-         return true;
-      }
-      return false;
    }
 
    bool CanTrade(string &reason) {
       Update();
-      if(m_emergencyStop) {
-         reason = "Emergency stop - daily loss limit";
-         return false;
-      }
+      if(m_dailyLossHit) { reason = "Daily loss limit hit"; return false; }
       if(m_dailyTargetHit && !m_ignoreDailyTarget) {
          reason = "Daily profit target hit";
          return false;
       }
-      if(m_dailyLossHit) { reason = "Daily loss limit hit"; return false; }
       if(!m_ignoreDailyTarget && m_tradesOpened >= m_params.maxTradesPerDay) {
          reason = "Max trades/day reached";
          return false;
@@ -168,20 +141,44 @@ public:
          return 0;
       }
 
-      double lot     = riskAmount / (slDist / tickSize * tickVal);
+      double lossPerLot = (slDist / tickSize) * tickVal;
+      if(lossPerLot <= 0) return 0;
+
+      double lot     = riskAmount / lossPerLot;
       double minLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
       double maxLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
       double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
 
       if(lotStep <= 0) lotStep = 0.01;
       lot = MathFloor(lot / lotStep) * lotStep;
-      lot = MathMax(minLot, MathMin(maxLot, lot));
+      lot = MathMin(maxLot, lot);
+
+      if(lot < minLot) {
+         double minLotLoss = minLot * lossPerLot;
+         double minLotRiskPct = (minLotLoss / balance) * 100.0;
+         if(minLotRiskPct > m_params.riskPct * 3.0) {
+            Print("[Risk] SKIP ", symbol, ": min lot ", DoubleToString(minLot, 2),
+                  " risks ", DoubleToString(minLotRiskPct, 1),
+                  "% (max ", DoubleToString(m_params.riskPct * 3.0, 1),
+                  "%) bal=$", DoubleToString(balance, 2));
+            return 0;
+         }
+         lot = minLot;
+      }
 
       return lot;
    }
 
    void OnTradeClose(double pnl) {
       m_tradesToday++;
+      m_realizedPnL += pnl;
+
+      double realPct = 0;
+      if(m_dayStartBalance > 0)
+         realPct = (m_realizedPnL / m_dayStartBalance) * 100.0;
+      Print("[Risk] Realized day P&L: $", DoubleToString(m_realizedPnL, 2),
+            " (", DoubleToString(realPct, 1), "%)");
+
       if(pnl < 0) {
          m_streak.consecutiveLosses++;
          m_streak.consecutiveWins = 0;
@@ -204,17 +201,17 @@ public:
       }
    }
 
-   double GetDayPnL()       { return m_dayPnL; }
+   double GetDayPnL()       { return m_realizedPnL; }
    double GetDayPnLPct()    {
       if(m_dayStartBalance > 0)
-         return (m_dayPnL / m_dayStartBalance) * 100.0;
+         return (m_realizedPnL / m_dayStartBalance) * 100.0;
       return 0;
    }
    double GetStartBal()     { return m_dayStartBalance; }
    int    GetTradesToday()  { return m_tradesOpened; }
-   bool   IsDailyDone()     { return (m_dailyTargetHit || m_dailyLossHit || m_emergencyStop); }
+   bool   IsDailyDone()     { return (m_dailyTargetHit || m_dailyLossHit); }
    bool   IsTargetHit()     { return m_dailyTargetHit; }
-   bool   IsLossHit()       { return (m_dailyLossHit || m_emergencyStop); }
+   bool   IsLossHit()       { return m_dailyLossHit; }
    double GetSizeMult()     { return m_streak.sizeMult; }
    int    GetLosses()       { return m_streak.consecutiveLosses; }
    int    GetWins()         { return m_streak.consecutiveWins; }

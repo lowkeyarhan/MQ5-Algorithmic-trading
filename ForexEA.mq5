@@ -1,11 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   ForexEA.mq5   |
-//|              SMC Structure + Liquidity Sweep Scalper v6.0       |
+//|              SMC Structure + Liquidity Sweep Scalper v6.1       |
 //|                                                                  |
-//|  v6.0: No pausing. 10% daily loss hard cap. Let strategy work. |
+//|  v6.1: No emergency stop. Daily loss blocks new trades only.    |
+//|        Open trades run to SL/TP naturally. Never force-closed.  |
 //+------------------------------------------------------------------+
 #property copyright "SMC_ScalperEA"
-#property version   "6.0"
+#property version   "6.1"
 #property description "SMC Scalper | Asia Sweep + Swing BOS | OB/FVG Entry | 1:3 RR Min"
 #property strict
 
@@ -66,6 +67,7 @@ CRiskManager        *g_risk;
 CTradeManager       *g_trade;
 CLogger             *g_logger;
 datetime             g_lastBar;
+datetime             g_lastResetDate;
 int                  g_totalTrades;
 ENUM_SIGNAL_DIRECTION g_lastDir;
 string               g_lastReason;
@@ -134,7 +136,7 @@ int OnInit() {
    g_logger = new CLogger();
    if(InpShowDashboard) g_logger.Init();
 
-   g_lastBar = 0; g_totalTrades = 0;
+   g_lastBar = 0; g_lastResetDate = 0; g_totalTrades = 0;
    g_lastDir = SIGNAL_NONE; g_lastReason = "Waiting...";
 
    EventSetTimer(30);
@@ -152,18 +154,34 @@ void OnDeinit(const int reason) {
 }
 
 //============================================================
+//  DAILY RESET (works in both live and Strategy Tester)
+//============================================================
+
+void CheckDailyReset() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   datetime today = StructToTime(dt);
+
+   if(g_lastResetDate != 0 && today != g_lastResetDate) {
+      for(int i = 0; i < g_pairCount; i++) {
+         g_pairs[i].lastSession = SESSION_NONE;
+         g_pairs[i].engine.ResetDay();
+      }
+      if(g_risk) g_risk.Update();
+      g_lastReason = "Waiting...";
+      g_lastDir = SIGNAL_NONE;
+      Print("=== DAILY RESET ===");
+   }
+   g_lastResetDate = today;
+}
+
+//============================================================
 //  MAIN TICK
 //============================================================
 
 void OnTick() {
-   // Emergency stop: check EVERY tick if daily loss exceeded
-   if(g_risk && g_risk.CheckEmergencyStop()) {
-      if(g_trade.CountPositions() > 0 || g_trade.CountPending() > 0) {
-         Print("!!! DAILY LOSS LIMIT -- CLOSING ALL !!!");
-         g_trade.CloseAll();
-      }
-      return;
-   }
+   CheckDailyReset();
 
    bool isNewBar = false;
    for(int i = 0; i < g_pairCount; i++) {

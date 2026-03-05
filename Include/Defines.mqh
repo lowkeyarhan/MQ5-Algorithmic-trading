@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                                      Defines.mqh |
 //|           SMC Structure + Liquidity Sweep Scalper                |
-//|                     Core Definitions v6.0                        |
+//|                     Core Definitions v6.1                        |
 //+------------------------------------------------------------------+
 #ifndef DEFINES_MQH
 #define DEFINES_MQH
@@ -128,7 +128,7 @@ struct SStreakControl {
 //  CONSTANTS
 //============================================================
 #define EA_NAME            "SMC_ScalperEA"
-#define EA_VERSION         "6.0.0"
+#define EA_VERSION         "6.1.0"
 #define MAGIC_NUMBER       20250305L
 
 // Killzones (GMT hours)
