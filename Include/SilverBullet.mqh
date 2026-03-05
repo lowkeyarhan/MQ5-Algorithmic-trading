@@ -1,6 +1,18 @@
 //+------------------------------------------------------------------+
 //|                                               SilverBullet.mqh  |
-//|         SMC Structure + Liquidity Sweep Scalp Engine v4.0       |
+//|         SMC Structure + Liquidity Sweep Scalp Engine v6.0       |
+//|                                                                  |
+//|  TWO SETUP MODES:                                                |
+//|  MODE 1: Asia sweep -- highest probability, no bias filter      |
+//|  MODE 2: Swing BOS  -- needs H1 OR M15 alignment (not both)    |
+//|                                                                  |
+//|  v6.0 CHANGES:                                                   |
+//|  - Asia sweeps taken regardless of H1 bias (they ARE reversals) |
+//|  - Swing BOS needs EITHER H1 or M15 agreement (not both)       |
+//|  - Displacement 0.5x ATR (was 0.6 -- too strict)               |
+//|  - Swing lookback 4 (was 5)                                     |
+//|  - Cooldown 5 bars = 25 min (was 8 = 40 min)                   |
+//|  - No OTE fallback (kept from v5.1)                              |
 //+------------------------------------------------------------------+
 #ifndef SILVERBULLET_MQH
 #define SILVERBULLET_MQH
@@ -22,19 +34,22 @@ private:
    double           m_pipSize;
    int              m_gmtOffsetSec;
 
-   double PipsToPrice(double pips) {
-      return pips * m_pipSize;
-   }
+   SSwingPoint      m_swingHighs[];
+   SSwingPoint      m_swingLows[];
+   int              m_shCount;
+   int              m_slCount;
+   datetime         m_lastSwingUpdate;
 
-   double PriceToPips(double priceDistance) {
+   datetime         m_lastTradeBar;
+
+   double PipsToPrice(double pips)      { return pips * m_pipSize; }
+   double PriceToPips(double priceDist) {
       if(m_pipSize <= 0) return 0;
-      return priceDistance / m_pipSize;
+      return priceDist / m_pipSize;
    }
 
    int DetectGMTOffset() {
-      datetime gmt    = TimeGMT();
-      datetime server = TimeCurrent();
-      return (int)(server - gmt);
+      return (int)(TimeCurrent() - TimeGMT());
    }
 
    datetime ServerToGMT(datetime serverTime) {
@@ -86,21 +101,18 @@ private:
       return buf[1];
    }
 
+   //==========================================================
+   // H1 BIAS
+   //==========================================================
    ENUM_HTF_BIAS GetH1Bias() {
-      double h1Close1 = iClose(m_symbol, m_biasTF, 1);
-      double h1Close2 = iClose(m_symbol, m_biasTF, 2);
-      double h1Close3 = iClose(m_symbol, m_biasTF, 3);
-      double h1High1  = iHigh(m_symbol, m_biasTF, 1);
-      double h1Low1   = iLow(m_symbol, m_biasTF, 1);
-      double h1High2  = iHigh(m_symbol, m_biasTF, 2);
-      double h1Low2   = iLow(m_symbol, m_biasTF, 2);
-
-      if(h1Close1 <= 0 || h1Close2 <= 0) return BIAS_NONE;
-
-      bool hh = (h1High1 > h1High2);
-      bool hl = (h1Low1  > h1Low2);
-      bool lh = (h1High1 < h1High2);
-      bool ll = (h1Low1  < h1Low2);
+      double c1 = iClose(m_symbol, m_biasTF, 1);
+      double c2 = iClose(m_symbol, m_biasTF, 2);
+      double c3 = iClose(m_symbol, m_biasTF, 3);
+      double hi1 = iHigh(m_symbol, m_biasTF, 1);
+      double lo1 = iLow(m_symbol, m_biasTF, 1);
+      double hi2 = iHigh(m_symbol, m_biasTF, 2);
+      double lo2 = iLow(m_symbol, m_biasTF, 2);
+      if(c1 <= 0 || c2 <= 0) return BIAS_NONE;
 
       double ema[];
       ArraySetAsSeries(ema, true);
@@ -108,37 +120,185 @@ private:
       if(emaH != INVALID_HANDLE) {
          if(CopyBuffer(emaH, 0, 0, 3, ema) >= 2) {
             IndicatorRelease(emaH);
-            bool aboveEMA = (h1Close1 > ema[1]);
-            bool belowEMA = (h1Close1 < ema[1]);
-
-            if((hh && hl) || (hh && aboveEMA) || (hl && aboveEMA))
-               return BIAS_BULLISH;
-            if((lh && ll) || (lh && belowEMA) || (ll && belowEMA))
-               return BIAS_BEARISH;
-
-            if(aboveEMA) return BIAS_BULLISH;
-            if(belowEMA) return BIAS_BEARISH;
+            if(c1 > ema[1] && hi1 > hi2) return BIAS_BULLISH;
+            if(c1 < ema[1] && lo1 < lo2) return BIAS_BEARISH;
+            if(c1 > ema[1]) return BIAS_BULLISH;
+            if(c1 < ema[1]) return BIAS_BEARISH;
          } else {
             IndicatorRelease(emaH);
          }
       }
-
-      if(h1Close1 > h1Close3) return BIAS_BULLISH;
-      if(h1Close1 < h1Close3) return BIAS_BEARISH;
-
+      if(c1 > c3) return BIAS_BULLISH;
+      if(c1 < c3) return BIAS_BEARISH;
       return BIAS_NONE;
    }
 
+   //==========================================================
+   // M15 STRUCTURE DIRECTION
+   //==========================================================
+   ENUM_HTF_BIAS GetM15Bias() {
+      double c1 = iClose(m_symbol, m_htf, 1);
+      double c2 = iClose(m_symbol, m_htf, 2);
+      double c3 = iClose(m_symbol, m_htf, 3);
+      if(c1 <= 0 || c2 <= 0 || c3 <= 0) return BIAS_NONE;
+
+      double hi1 = iHigh(m_symbol, m_htf, 1);
+      double lo1 = iLow(m_symbol, m_htf, 1);
+      double hi2 = iHigh(m_symbol, m_htf, 2);
+      double lo2 = iLow(m_symbol, m_htf, 2);
+
+      if(c1 > c3 && hi1 > hi2) return BIAS_BULLISH;
+      if(c1 < c3 && lo1 < lo2) return BIAS_BEARISH;
+      if(c1 > c3) return BIAS_BULLISH;
+      if(c1 < c3) return BIAS_BEARISH;
+      return BIAS_NONE;
+   }
+
+   //==========================================================
+   // SWING STRUCTURE DETECTION
+   //==========================================================
+   void UpdateSwingStructure() {
+      datetime currentBar = iTime(m_symbol, m_tf, 0);
+      if(currentBar == m_lastSwingUpdate) return;
+      m_lastSwingUpdate = currentBar;
+
+      int lb = SWING_LOOKBACK;
+      int totalBars = iBars(m_symbol, m_tf);
+      int scanBars = MathMin(totalBars - 1, 80);
+
+      m_shCount = 0;
+      m_slCount = 0;
+      ArrayResize(m_swingHighs, MAX_SWING_POINTS);
+      ArrayResize(m_swingLows,  MAX_SWING_POINTS);
+
+      double minRange = m_isGold ? PipsToPrice(MIN_SWING_RANGE_GOLD) : PipsToPrice(MIN_SWING_RANGE_FX);
+
+      for(int i = lb; i < scanBars - lb; i++) {
+         if(m_shCount >= MAX_SWING_POINTS && m_slCount >= MAX_SWING_POINTS)
+            break;
+
+         double hi = iHigh(m_symbol, m_tf, i);
+         double lo = iLow(m_symbol,  m_tf, i);
+
+         if(m_shCount < MAX_SWING_POINTS) {
+            bool isSwingHi = true;
+            for(int j = 1; j <= lb; j++) {
+               if(iHigh(m_symbol, m_tf, i - j) >= hi ||
+                  iHigh(m_symbol, m_tf, i + j) >= hi) {
+                  isSwingHi = false;
+                  break;
+               }
+            }
+            if(isSwingHi) {
+               double localLow = lo;
+               for(int j = 1; j <= lb; j++) {
+                  double ll = iLow(m_symbol, m_tf, i + j);
+                  if(ll < localLow) localLow = ll;
+               }
+               if((hi - localLow) >= minRange) {
+                  m_swingHighs[m_shCount].price    = hi;
+                  m_swingHighs[m_shCount].time     = iTime(m_symbol, m_tf, i);
+                  m_swingHighs[m_shCount].barIndex = i;
+                  m_swingHighs[m_shCount].isHigh   = true;
+                  m_swingHighs[m_shCount].swept    = false;
+                  m_shCount++;
+               }
+            }
+         }
+
+         if(m_slCount < MAX_SWING_POINTS) {
+            bool isSwingLo = true;
+            for(int j = 1; j <= lb; j++) {
+               if(iLow(m_symbol, m_tf, i - j) <= lo ||
+                  iLow(m_symbol, m_tf, i + j) <= lo) {
+                  isSwingLo = false;
+                  break;
+               }
+            }
+            if(isSwingLo) {
+               double localHigh = hi;
+               for(int j = 1; j <= lb; j++) {
+                  double hh = iHigh(m_symbol, m_tf, i + j);
+                  if(hh > localHigh) localHigh = hh;
+               }
+               if((localHigh - lo) >= minRange) {
+                  m_swingLows[m_slCount].price    = lo;
+                  m_swingLows[m_slCount].time     = iTime(m_symbol, m_tf, i);
+                  m_swingLows[m_slCount].barIndex = i;
+                  m_swingLows[m_slCount].isHigh   = false;
+                  m_swingLows[m_slCount].swept    = false;
+                  m_slCount++;
+               }
+            }
+         }
+      }
+   }
+
+   //==========================================================
+   // CHECK SWING SWEEP
+   //==========================================================
+   bool CheckSwingSweep(ENUM_SIGNAL_DIRECTION &sweepDir,
+                        double &sweepWick, datetime &sweepTime) {
+      double sweepMin, sweepMax;
+      if(m_isGold)     { sweepMin = PipsToPrice(SWEEP_MIN_PIPS_GOLD); sweepMax = PipsToPrice(SWEEP_MAX_PIPS_GOLD); }
+      else if(m_isJPY) { sweepMin = PipsToPrice(SWEEP_MIN_PIPS_JPY);  sweepMax = PipsToPrice(SWEEP_MAX_PIPS_JPY);  }
+      else             { sweepMin = PipsToPrice(SWEEP_MIN_PIPS_FX);    sweepMax = PipsToPrice(SWEEP_MAX_PIPS_FX);   }
+
+      int barsToCheck = MathMin(3, iBars(m_symbol, m_tf) - 1);
+      int minSwingAge = SWING_LOOKBACK * 2;
+
+      for(int i = 1; i <= barsToCheck; i++) {
+         double hi = iHigh(m_symbol,  m_tf, i);
+         double lo = iLow(m_symbol,   m_tf, i);
+         double cl = iClose(m_symbol, m_tf, i);
+
+         for(int s = 0; s < m_shCount; s++) {
+            if(m_swingHighs[s].swept) continue;
+            if(m_swingHighs[s].barIndex <= i + 1) continue;
+            if(m_swingHighs[s].barIndex - i < minSwingAge) continue;
+            double pierce = hi - m_swingHighs[s].price;
+            if(pierce >= sweepMin && pierce <= sweepMax && cl <= m_swingHighs[s].price) {
+               m_swingHighs[s].swept = true;
+               sweepDir  = SIGNAL_SELL;
+               sweepWick = hi;
+               sweepTime = iTime(m_symbol, m_tf, i);
+               Print("[", m_symbol, "] SWING HI SWEEP bar[", IntegerToString(i),
+                     "] lvl=", DoubleToString(m_swingHighs[s].price, 2),
+                     " age=", IntegerToString(m_swingHighs[s].barIndex - i), "b");
+               return true;
+            }
+         }
+
+         for(int s = 0; s < m_slCount; s++) {
+            if(m_swingLows[s].swept) continue;
+            if(m_swingLows[s].barIndex <= i + 1) continue;
+            if(m_swingLows[s].barIndex - i < minSwingAge) continue;
+            double pierce = m_swingLows[s].price - lo;
+            if(pierce >= sweepMin && pierce <= sweepMax && cl >= m_swingLows[s].price) {
+               m_swingLows[s].swept = true;
+               sweepDir  = SIGNAL_BUY;
+               sweepWick = lo;
+               sweepTime = iTime(m_symbol, m_tf, i);
+               Print("[", m_symbol, "] SWING LO SWEEP bar[", IntegerToString(i),
+                     "] lvl=", DoubleToString(m_swingLows[s].price, 2),
+                     " age=", IntegerToString(m_swingLows[s].barIndex - i), "b");
+               return true;
+            }
+         }
+      }
+      return false;
+   }
+
+   //==========================================================
+   // ASIA MAPPING + SWEEP
+   //==========================================================
    void MapAsiaLevels() {
       datetime today = GetGMTDate();
       if(m_asia.valid && m_asia.date == today) return;
 
-      m_asia.high      = -1;
-      m_asia.low       = -1;
-      m_asia.valid     = false;
-      m_asia.highSwept = false;
-      m_asia.lowSwept  = false;
-      m_asia.date      = today;
+      m_asia.high = -1; m_asia.low = -1;
+      m_asia.valid = false; m_asia.highSwept = false; m_asia.lowSwept = false;
+      m_asia.date = today;
 
       int bars = iBars(m_symbol, m_tf);
       if(bars < 10) return;
@@ -148,20 +308,14 @@ private:
       for(int i = 1; i <= maxScan; i++) {
          datetime barTime = iTime(m_symbol, m_tf, i);
          if(barTime <= 0) continue;
-
          int gmtH, gmtM;
          ServerTimeToGMTComponents(barTime, gmtH, gmtM);
-
          datetime barGMT = ServerToGMT(barTime);
          MqlDateTime barDt;
          TimeToStruct(barGMT, barDt);
          barDt.hour = 0; barDt.min = 0; barDt.sec = 0;
          datetime barDate = StructToTime(barDt);
-
-         if(barDate != today) {
-            if(counted > 0) break;
-            continue;
-         }
+         if(barDate != today) { if(counted > 0) break; continue; }
 
          if(gmtH >= ASIA_H_START && gmtH < ASIA_H_END) {
             double h = iHigh(m_symbol, m_tf, i);
@@ -171,295 +325,193 @@ private:
             counted++;
          }
       }
-
       if(counted >= 3 && m_asia.high > 0 && m_asia.low > 0 && m_asia.high > m_asia.low) {
          m_asia.valid = true;
-         double range = PriceToPips(m_asia.high - m_asia.low);
-         Print("[", m_symbol, "] Asia mapped: High=", DoubleToString(m_asia.high, 5),
-               " Low=", DoubleToString(m_asia.low, 5),
-               " Range=", DoubleToString(range, 1), " pips (",
-               IntegerToString(counted), " bars)");
-      } else {
-         Print("[", m_symbol, "] Asia mapping incomplete: counted=", IntegerToString(counted));
+         Print("[", m_symbol, "] Asia: Hi=", DoubleToString(m_asia.high, 2),
+               " Lo=", DoubleToString(m_asia.low, 2),
+               " Range=", DoubleToString(PriceToPips(m_asia.high-m_asia.low), 1), "p");
       }
    }
 
-   bool CheckSweep(ENUM_SIGNAL_DIRECTION &sweepDir) {
+   bool CheckAsiaSweep(ENUM_SIGNAL_DIRECTION &sweepDir,
+                       double &sweepWick, datetime &sweepTime) {
       if(!m_asia.valid) return false;
-
       double sweepMin, sweepMax;
-      if(m_isGold) {
-         sweepMin = PipsToPrice(SWEEP_MIN_PIPS_GOLD);
-         sweepMax = PipsToPrice(SWEEP_MAX_PIPS_GOLD);
-      } else if(m_isJPY) {
-         sweepMin = PipsToPrice(SWEEP_MIN_PIPS_JPY);
-         sweepMax = PipsToPrice(SWEEP_MAX_PIPS_JPY);
-      } else {
-         sweepMin = PipsToPrice(SWEEP_MIN_PIPS_FX);
-         sweepMax = PipsToPrice(SWEEP_MAX_PIPS_FX);
-      }
+      if(m_isGold)     { sweepMin = PipsToPrice(SWEEP_MIN_PIPS_GOLD); sweepMax = PipsToPrice(SWEEP_MAX_PIPS_GOLD); }
+      else if(m_isJPY) { sweepMin = PipsToPrice(SWEEP_MIN_PIPS_JPY);  sweepMax = PipsToPrice(SWEEP_MAX_PIPS_JPY);  }
+      else             { sweepMin = PipsToPrice(SWEEP_MIN_PIPS_FX);    sweepMax = PipsToPrice(SWEEP_MAX_PIPS_FX);   }
 
       int barsToCheck = MathMin(5, iBars(m_symbol, m_tf) - 1);
-
       for(int i = 1; i <= barsToCheck; i++) {
-         double high_i  = iHigh(m_symbol,  m_tf, i);
-         double low_i   = iLow(m_symbol,   m_tf, i);
-         double close_i = iClose(m_symbol, m_tf, i);
+         double hi = iHigh(m_symbol,  m_tf, i);
+         double lo = iLow(m_symbol,   m_tf, i);
+         double cl = iClose(m_symbol, m_tf, i);
 
          if(!m_asia.highSwept) {
-            double pierce = high_i - m_asia.high;
-            if(pierce >= sweepMin && pierce <= sweepMax) {
-               if(close_i <= m_asia.high) {
-                  m_asia.highSwept    = true;
-                  m_asia.sweepWickTip = high_i;
-                  m_asia.sweepTime    = iTime(m_symbol, m_tf, i);
-                  sweepDir            = SIGNAL_SELL;
-                  Print("[", m_symbol, "] SELL SWEEP bar[", IntegerToString(i),
-                        "]: AsiaHi=", DoubleToString(m_asia.high, 5),
-                        " wick=", DoubleToString(high_i, 5),
-                        " close=", DoubleToString(close_i, 5));
-                  return true;
-               }
+            double pierce = hi - m_asia.high;
+            if(pierce >= sweepMin && pierce <= sweepMax && cl <= m_asia.high) {
+               m_asia.highSwept = true;
+               sweepDir = SIGNAL_SELL; sweepWick = hi; sweepTime = iTime(m_symbol, m_tf, i);
+               Print("[", m_symbol, "] ASIA HI SWEEP bar[", IntegerToString(i), "]");
+               return true;
             }
          }
-
          if(!m_asia.lowSwept) {
-            double pierce = m_asia.low - low_i;
-            if(pierce >= sweepMin && pierce <= sweepMax) {
-               if(close_i >= m_asia.low) {
-                  m_asia.lowSwept     = true;
-                  m_asia.sweepWickTip = low_i;
-                  m_asia.sweepTime    = iTime(m_symbol, m_tf, i);
-                  sweepDir            = SIGNAL_BUY;
-                  Print("[", m_symbol, "] BUY SWEEP bar[", IntegerToString(i),
-                        "]: AsiaLo=", DoubleToString(m_asia.low, 5),
-                        " wick=", DoubleToString(low_i, 5),
-                        " close=", DoubleToString(close_i, 5));
-                  return true;
-               }
+            double pierce = m_asia.low - lo;
+            if(pierce >= sweepMin && pierce <= sweepMax && cl >= m_asia.low) {
+               m_asia.lowSwept = true;
+               sweepDir = SIGNAL_BUY; sweepWick = lo; sweepTime = iTime(m_symbol, m_tf, i);
+               Print("[", m_symbol, "] ASIA LO SWEEP bar[", IntegerToString(i), "]");
+               return true;
             }
          }
       }
       return false;
    }
 
-   bool DetectCHoCHandFVG(ENUM_SIGNAL_DIRECTION dir, SFVG &fvg) {
+   //==========================================================
+   // FVG / OB DETECTION -- NO OTE FALLBACK
+   //==========================================================
+   bool DetectFVGorOB(ENUM_SIGNAL_DIRECTION dir, datetime afterTime, SFVG &fvg) {
       double atr = GetATR(m_tf, 14);
-      if(atr <= 0) {
-         Print("[", m_symbol, "] ATR unavailable");
-         return false;
-      }
-
+      if(atr <= 0) return false;
       double minBody = atr * DISP_ATR_MULT;
       int maxBars = MathMin(iBars(m_symbol, m_tf) - 2, 20);
 
       for(int i = 1; i < maxBars; i++) {
          datetime barT = iTime(m_symbol, m_tf, i);
-         if(barT <= m_asia.sweepTime) continue;
+         if(barT <= afterTime) continue;
 
-         double open_i  = iOpen(m_symbol,  m_tf, i);
-         double high_i  = iHigh(m_symbol,  m_tf, i);
-         double low_i   = iLow(m_symbol,   m_tf, i);
-         double close_i = iClose(m_symbol, m_tf, i);
-         double body    = MathAbs(close_i - open_i);
+         double op = iOpen(m_symbol,  m_tf, i);
+         double hi = iHigh(m_symbol,  m_tf, i);
+         double lo = iLow(m_symbol,   m_tf, i);
+         double cl = iClose(m_symbol, m_tf, i);
+         double body = MathAbs(cl - op);
 
          if(dir == SIGNAL_BUY) {
-            if(close_i <= open_i) continue;
-            if(body < minBody) continue;
-
+            if(cl <= op || body < minBody) continue;
             if(i + 1 < maxBars && i - 1 >= 0) {
-               double prevHigh = iHigh(m_symbol, m_tf, i + 1);
-               double nextLow  = iLow(m_symbol,  m_tf, i - 1);
-               if(prevHigh < nextLow) {
-                  fvg.isBullish = true;
-                  fvg.lower     = prevHigh;
-                  fvg.upper     = nextLow;
-                  fvg.midpoint  = (fvg.lower + fvg.upper) / 2.0;
-                  fvg.time      = barT;
-                  fvg.active    = true;
-                  Print("[", m_symbol, "] BUY FVG bar[", IntegerToString(i),
-                        "]: ", DoubleToString(fvg.lower, 5),
-                        "-", DoubleToString(fvg.upper, 5));
+               double prevH = iHigh(m_symbol, m_tf, i + 1);
+               double nextL = iLow(m_symbol,  m_tf, i - 1);
+               if(prevH < nextL) {
+                  fvg.isBullish = true; fvg.lower = prevH; fvg.upper = nextL;
+                  fvg.midpoint = (prevH + nextL) / 2.0; fvg.time = barT; fvg.active = true;
                   return true;
                }
             }
-
             for(int j = i + 1; j < i + 5 && j < maxBars; j++) {
-               double ob_open  = iOpen(m_symbol,  m_tf, j);
-               double ob_close = iClose(m_symbol, m_tf, j);
-               double ob_low   = iLow(m_symbol,   m_tf, j);
-               if(ob_close < ob_open) {
-                  fvg.isBullish = true;
-                  fvg.lower     = ob_low;
-                  fvg.upper     = ob_open;
-                  fvg.midpoint  = (ob_low + ob_open) / 2.0;
-                  fvg.time      = iTime(m_symbol, m_tf, j);
-                  fvg.active    = true;
-                  Print("[", m_symbol, "] BUY OB bar[", IntegerToString(j), "]");
+               double oc = iClose(m_symbol, m_tf, j);
+               double oo = iOpen(m_symbol,  m_tf, j);
+               double ol = iLow(m_symbol,   m_tf, j);
+               if(oc < oo) {
+                  fvg.isBullish = true; fvg.lower = ol; fvg.upper = oo;
+                  fvg.midpoint = (ol + oo) / 2.0; fvg.time = iTime(m_symbol, m_tf, j); fvg.active = true;
                   return true;
                }
             }
-
-            fvg.isBullish = true;
-            fvg.lower     = low_i;
-            fvg.upper     = low_i + (high_i - low_i) * 0.5;
-            fvg.midpoint  = low_i + (high_i - low_i) * 0.382;
-            fvg.time      = barT;
-            fvg.active    = true;
-            Print("[", m_symbol, "] BUY OTE fallback bar[", IntegerToString(i), "]");
-            return true;
          }
 
          if(dir == SIGNAL_SELL) {
-            if(close_i >= open_i) continue;
-            if(body < minBody) continue;
-
+            if(cl >= op || body < minBody) continue;
             if(i + 1 < maxBars && i - 1 >= 0) {
-               double prevLow  = iLow(m_symbol,  m_tf, i + 1);
-               double nextHigh = iHigh(m_symbol, m_tf, i - 1);
-               if(prevLow > nextHigh) {
-                  fvg.isBullish = false;
-                  fvg.upper     = prevLow;
-                  fvg.lower     = nextHigh;
-                  fvg.midpoint  = (fvg.upper + fvg.lower) / 2.0;
-                  fvg.time      = barT;
-                  fvg.active    = true;
-                  Print("[", m_symbol, "] SELL FVG bar[", IntegerToString(i),
-                        "]: ", DoubleToString(fvg.lower, 5),
-                        "-", DoubleToString(fvg.upper, 5));
+               double prevL = iLow(m_symbol,  m_tf, i + 1);
+               double nextH = iHigh(m_symbol, m_tf, i - 1);
+               if(prevL > nextH) {
+                  fvg.isBullish = false; fvg.upper = prevL; fvg.lower = nextH;
+                  fvg.midpoint = (prevL + nextH) / 2.0; fvg.time = barT; fvg.active = true;
                   return true;
                }
             }
-
             for(int j = i + 1; j < i + 5 && j < maxBars; j++) {
-               double ob_open  = iOpen(m_symbol,  m_tf, j);
-               double ob_close = iClose(m_symbol, m_tf, j);
-               double ob_high  = iHigh(m_symbol,  m_tf, j);
-               if(ob_close > ob_open) {
-                  fvg.isBullish = false;
-                  fvg.upper     = ob_high;
-                  fvg.lower     = ob_open;
-                  fvg.midpoint  = (ob_high + ob_open) / 2.0;
-                  fvg.time      = iTime(m_symbol, m_tf, j);
-                  fvg.active    = true;
-                  Print("[", m_symbol, "] SELL OB bar[", IntegerToString(j), "]");
+               double oc = iClose(m_symbol, m_tf, j);
+               double oo = iOpen(m_symbol,  m_tf, j);
+               double oh = iHigh(m_symbol,  m_tf, j);
+               if(oc > oo) {
+                  fvg.isBullish = false; fvg.upper = oh; fvg.lower = oo;
+                  fvg.midpoint = (oh + oo) / 2.0; fvg.time = iTime(m_symbol, m_tf, j); fvg.active = true;
                   return true;
                }
             }
-
-            fvg.isBullish = false;
-            fvg.upper     = high_i;
-            fvg.lower     = high_i - (high_i - low_i) * 0.5;
-            fvg.midpoint  = high_i - (high_i - low_i) * 0.382;
-            fvg.time      = barT;
-            fvg.active    = true;
-            Print("[", m_symbol, "] SELL OTE fallback bar[", IntegerToString(i), "]");
-            return true;
          }
       }
       return false;
    }
 
+   //==========================================================
+   // SPREAD CHECK
+   //==========================================================
    bool SpreadOK() {
-      double spreadPoints = (double)SymbolInfoInteger(m_symbol, SYMBOL_SPREAD)
-                            * SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-      double spreadPips   = PriceToPips(spreadPoints);
-
-      double maxPips;
-      if(m_isGold)     maxPips = MAX_SPREAD_PIPS_GOLD;
-      else if(m_isBTC) maxPips = MAX_SPREAD_PIPS_BTC;
-      else             maxPips = MAX_SPREAD_PIPS_FX;
-
-      if(spreadPips > maxPips) {
-         Print("[", m_symbol, "] Spread too wide: ",
-               DoubleToString(spreadPips, 1), " pips (max ",
-               DoubleToString(maxPips, 1), ")");
-         return false;
-      }
-      return true;
+      double sp = (double)SymbolInfoInteger(m_symbol, SYMBOL_SPREAD)
+                  * SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double spPips = PriceToPips(sp);
+      double maxP;
+      if(m_isGold) maxP = MAX_SPREAD_PIPS_GOLD;
+      else if(m_isBTC) maxP = MAX_SPREAD_PIPS_BTC;
+      else maxP = MAX_SPREAD_PIPS_FX;
+      return (spPips <= maxP);
    }
 
-   double FindLiquidityTarget(ENUM_SIGNAL_DIRECTION dir, double entry, double minTPDist) {
-      int barsToScan = MathMin(100, iBars(m_symbol, m_htf) - 1);
+   //==========================================================
+   // LIQUIDITY TARGET
+   //==========================================================
+   double FindLiquidityTarget(ENUM_SIGNAL_DIRECTION dir, double entry, double minDist) {
+      int scan = MathMin(100, iBars(m_symbol, m_htf) - 1);
       if(dir == SIGNAL_BUY) {
-         double bestTarget = entry + minTPDist;
-         for(int i = 1; i < barsToScan; i++) {
+         for(int i = 1; i < scan; i++) {
             double h = iHigh(m_symbol, m_htf, i);
-            if(h > entry + minTPDist * 0.8 && h > entry) {
-               if(h - entry >= minTPDist) { bestTarget = h; break; }
-            }
+            if(h - entry >= minDist) return h;
          }
-         return bestTarget;
+         return entry + minDist;
       } else {
-         double bestTarget = entry - minTPDist;
-         for(int i = 1; i < barsToScan; i++) {
+         for(int i = 1; i < scan; i++) {
             double l = iLow(m_symbol, m_htf, i);
-            if(l < entry - minTPDist * 0.8 && l < entry) {
-               if(entry - l >= minTPDist) { bestTarget = l; break; }
-            }
+            if(entry - l >= minDist) return l;
          }
-         return bestTarget;
+         return entry - minDist;
       }
    }
 
-   bool BuildSetup(ENUM_SIGNAL_DIRECTION dir, SFVG &fvg, ENUM_SESSION session) {
-      int    digits = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
-      double point  = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-      double entry  = NormalizeDouble(fvg.midpoint, digits);
+   //==========================================================
+   // BUILD SETUP
+   //==========================================================
+   bool BuildSetup(ENUM_SIGNAL_DIRECTION dir, SFVG &fvg,
+                   double sweepWick, ENUM_SESSION session,
+                   ENUM_SETUP_TYPE sType) {
+      int digits = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
+      double entry = NormalizeDouble(fvg.midpoint, digits);
       double sl;
 
-      double buffer = PipsToPrice(0.5);
-      if(m_isGold) buffer = PipsToPrice(1.0);
+      double buffer = m_isGold ? PipsToPrice(1.0) : PipsToPrice(0.5);
 
       if(dir == SIGNAL_BUY) {
-         sl = NormalizeDouble(m_asia.sweepWickTip - buffer, digits);
-         if(entry <= sl) {
-            Print("[", m_symbol, "] BUY rejected: entry<=SL");
-            return false;
-         }
+         sl = NormalizeDouble(sweepWick - buffer, digits);
+         if(entry <= sl) return false;
       } else {
-         sl = NormalizeDouble(m_asia.sweepWickTip + buffer, digits);
-         if(entry >= sl) {
-            Print("[", m_symbol, "] SELL rejected: entry>=SL");
-            return false;
-         }
+         sl = NormalizeDouble(sweepWick + buffer, digits);
+         if(entry >= sl) return false;
       }
 
       double slDist = MathAbs(entry - sl);
       double slPips = PriceToPips(slDist);
 
       double maxSL;
-      if(m_isGold)      maxSL = MAX_SL_PIPS_GOLD;
-      else if(m_isBTC)  maxSL = MAX_SL_PIPS_BTC;
-      else if(m_isJPY)  maxSL = MAX_SL_PIPS_JPY;
-      else              maxSL = MAX_SL_PIPS_FOREX;
+      if(m_isGold) maxSL = MAX_SL_PIPS_GOLD;
+      else if(m_isBTC) maxSL = MAX_SL_PIPS_BTC;
+      else if(m_isJPY) maxSL = MAX_SL_PIPS_JPY;
+      else maxSL = MAX_SL_PIPS_FOREX;
 
-      if(slPips > maxSL) {
-         Print("[", m_symbol, "] SL too wide: ", DoubleToString(slPips, 1), " pips");
-         return false;
-      }
-      if(slPips < 0.3) {
-         Print("[", m_symbol, "] SL too tight: ", DoubleToString(slPips, 1), " pips");
-         return false;
-      }
+      double minSL = m_isGold ? MIN_SL_PIPS_GOLD : MIN_SL_PIPS_FX;
+
+      if(slPips > maxSL || slPips < minSL) return false;
 
       double minTPDist = slDist * TARGET_RR;
-      double liqTarget = FindLiquidityTarget(dir, entry, minTPDist);
+      double liq = FindLiquidityTarget(dir, entry, minTPDist);
       double tp;
 
-      if(dir == SIGNAL_BUY) {
-         double liqDist = liqTarget - entry;
-         if(liqDist >= minTPDist)
-            tp = NormalizeDouble(liqTarget, digits);
-         else
-            tp = NormalizeDouble(entry + minTPDist, digits);
-      } else {
-         double liqDist = entry - liqTarget;
-         if(liqDist >= minTPDist)
-            tp = NormalizeDouble(liqTarget, digits);
-         else
-            tp = NormalizeDouble(entry - minTPDist, digits);
-      }
+      if(dir == SIGNAL_BUY)
+         tp = NormalizeDouble(((liq - entry) >= minTPDist) ? liq : entry + minTPDist, digits);
+      else
+         tp = NormalizeDouble(((entry - liq) >= minTPDist) ? liq : entry - minTPDist, digits);
 
       double actualRR = MathAbs(tp - entry) / slDist;
 
@@ -473,32 +525,43 @@ private:
       m_setup.fvgFound    = true;
       m_setup.chochDone   = true;
       m_setup.session     = session;
+      m_setup.setupType   = sType;
       m_setup.setupTime   = TimeCurrent();
       m_setup.phase       = PHASE_CONFIRMED;
+      m_setup.sweepWickTip = sweepWick;
 
-      string sesName = (session == SESSION_LONDON_KILL) ? "London" : "NY";
-      string fvgType = fvg.active ? "FVG" : "OB";
-      m_setup.reason = sesName + " sweep+CHoCH+" + fvgType
-                     + " SL=" + DoubleToString(slPips, 1) + "pips"
-                     + " RR=1:" + DoubleToString(actualRR, 1);
+      string sTypeStr = (sType == SETUP_ASIA_SWEEP) ? "Asia" : "Swing";
+      string dirStr   = (dir == SIGNAL_BUY) ? "BUY" : "SELL";
+      m_setup.reason = sTypeStr + " " + dirStr + " SL="
+                     + DoubleToString(slPips, 1) + "p RR=1:"
+                     + DoubleToString(actualRR, 1);
 
-      string dirStr = (dir == SIGNAL_BUY) ? "BUY" : "SELL";
-      Print("[", m_symbol, "] === SETUP CONFIRMED ===");
+      Print("[", m_symbol, "] === ", sTypeStr, " SETUP ===");
       Print("[", m_symbol, "] ", dirStr,
-            " Entry=", DoubleToString(entry, digits),
+            " E=", DoubleToString(entry, digits),
             " SL=", DoubleToString(sl, digits),
             " TP=", DoubleToString(tp, digits),
-            " SLpips=", DoubleToString(slPips, 1),
-            " RR=1:", DoubleToString(actualRR, 1));
+            " ", DoubleToString(slPips, 1), "p 1:",
+            DoubleToString(actualRR, 1));
       return true;
+   }
+
+   //==========================================================
+   // TRY BUILD FROM SWEEP
+   //==========================================================
+   bool TryBuildFromSweep(ENUM_SIGNAL_DIRECTION dir, double sweepWick,
+                          datetime sweepTime, ENUM_SESSION session,
+                          ENUM_SETUP_TYPE sType) {
+      SFVG fvg;
+      ZeroMemory(fvg);
+      if(!DetectFVGorOB(dir, sweepTime, fvg)) return false;
+      return BuildSetup(dir, fvg, sweepWick, session, sType);
    }
 
 public:
    CSilverBullet(string symbol, ENUM_TIMEFRAMES tf, ENUM_TIMEFRAMES htf) {
-      m_symbol  = symbol;
-      m_tf      = tf;
-      m_htf     = htf;
-      m_biasTF  = PERIOD_H1;
+      m_symbol = symbol; m_tf = tf; m_htf = htf;
+      m_biasTF = PERIOD_H1;
 
       m_isGold = (StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0);
       m_isJPY  = (StringFind(symbol, "JPY") >= 0);
@@ -510,75 +573,120 @@ public:
       else             m_pipSize = 0.0001;
 
       m_gmtOffsetSec = DetectGMTOffset();
-
-      ZeroMemory(m_asia);
-      ZeroMemory(m_setup);
+      ZeroMemory(m_asia); ZeroMemory(m_setup);
       m_setup.phase = PHASE_IDLE;
+      m_shCount = 0; m_slCount = 0;
+      m_lastSwingUpdate = 0; m_lastTradeBar = 0;
 
-      Print("[", symbol, "] Engine init: pipSize=", DoubleToString(m_pipSize, 5),
-            " gmtOffset=", IntegerToString(m_gmtOffsetSec/3600), "h",
-            " gold=", (m_isGold?"Y":"N"),
-            " jpy=", (m_isJPY?"Y":"N"));
+      ArrayResize(m_swingHighs, MAX_SWING_POINTS);
+      ArrayResize(m_swingLows,  MAX_SWING_POINTS);
+
+      Print("[", symbol, "] v6 engine init pip=", DoubleToString(m_pipSize, 5),
+            " gmt=", IntegerToString(m_gmtOffsetSec/3600), "h");
    }
 
+   //==========================================================
+   // MAIN UPDATE
+   //==========================================================
    bool Update() {
       ENUM_SESSION session = GetCurrentSession();
 
       if(session == SESSION_ASIA) {
          MapAsiaLevels();
-         if(m_setup.phase == PHASE_IDLE)
-            m_setup.phase = PHASE_WATCHING;
+         UpdateSwingStructure();
+         if(m_setup.phase == PHASE_IDLE) m_setup.phase = PHASE_WATCHING;
          return false;
       }
 
-      if(session != SESSION_LONDON_KILL && session != SESSION_NY_KILL)
+      if(session != SESSION_LONDON_KILL && session != SESSION_NY_KILL) {
+         UpdateSwingStructure();
          return false;
-
-      if(m_setup.phase == PHASE_CONFIRMED || m_setup.phase == PHASE_IN_TRADE)
-         return false;
-
-      if(!m_asia.valid) {
-         MapAsiaLevels();
-         if(!m_asia.valid) return false;
       }
 
+      if(m_setup.phase == PHASE_CONFIRMED)
+         return true;
+
+      UpdateSwingStructure();
+      if(!m_asia.valid) MapAsiaLevels();
       if(!SpreadOK()) return false;
 
-      ENUM_HTF_BIAS bias = GetH1Bias();
-
-      if(m_setup.phase == PHASE_WATCHING || m_setup.phase == PHASE_IDLE ||
-         m_setup.phase == PHASE_DONE) {
-         ENUM_SIGNAL_DIRECTION sweepDir = SIGNAL_NONE;
-         if(CheckSweep(sweepDir)) {
-            if(bias != BIAS_NONE) {
-               if(sweepDir == SIGNAL_BUY && bias == BIAS_BEARISH)
-                  Print("[", m_symbol, "] BUY sweep vs BEARISH H1 bias - caution");
-               if(sweepDir == SIGNAL_SELL && bias == BIAS_BULLISH)
-                  Print("[", m_symbol, "] SELL sweep vs BULLISH H1 bias - caution");
-            }
-            m_setup.direction = sweepDir;
-            m_setup.phase     = PHASE_SWEPT;
-         }
+      // Cooldown
+      datetime currentBar = iTime(m_symbol, m_tf, 0);
+      if(m_lastTradeBar > 0) {
+         int barsSince = (int)((currentBar - m_lastTradeBar) / PeriodSeconds(m_tf));
+         if(barsSince < MIN_BARS_BETWEEN_TRADES) return false;
       }
 
+      // Pending swept phase
       if(m_setup.phase == PHASE_SWEPT) {
          SFVG fvg;
          ZeroMemory(fvg);
-         if(DetectCHoCHandFVG(m_setup.direction, fvg)) {
-            if(BuildSetup(m_setup.direction, fvg, session))
+         datetime refTime = (m_asia.sweepTime > 0) ? m_asia.sweepTime : iTime(m_symbol, m_tf, 10);
+         if(DetectFVGorOB(m_setup.direction, refTime, fvg)) {
+            double wick = m_setup.sweepWickTip;
+            ENUM_SETUP_TYPE st = m_setup.setupType;
+            if(BuildSetup(m_setup.direction, fvg, wick, session, st))
                return true;
          }
 
          int barsSinceSweep = 0;
          if(m_asia.sweepTime > 0)
             barsSinceSweep = (int)((TimeCurrent() - m_asia.sweepTime) / PeriodSeconds(m_tf));
-
          if(barsSinceSweep > MAX_BARS_AFTER_SWEEP) {
-            Print("[", m_symbol, "] CHoCH timeout after ", IntegerToString(barsSinceSweep), " bars");
             m_setup.phase = PHASE_WATCHING;
             if(m_setup.direction == SIGNAL_BUY)  m_asia.lowSwept  = false;
             if(m_setup.direction == SIGNAL_SELL) m_asia.highSwept = false;
          }
+         return false;
+      }
+
+      // =====================================================
+      // MODE 1: Asia sweep -- NO bias filter (reversals are the point)
+      // =====================================================
+      ENUM_SIGNAL_DIRECTION asiaDir = SIGNAL_NONE;
+      double asiaWick = 0; datetime asiaSweepT = 0;
+      if(CheckAsiaSweep(asiaDir, asiaWick, asiaSweepT)) {
+         if(TryBuildFromSweep(asiaDir, asiaWick, asiaSweepT, session, SETUP_ASIA_SWEEP))
+            return true;
+         m_setup.direction    = asiaDir;
+         m_setup.phase        = PHASE_SWEPT;
+         m_setup.sweepWickTip = asiaWick;
+         m_setup.setupType    = SETUP_ASIA_SWEEP;
+         m_asia.sweepTime     = asiaSweepT;
+         return false;
+      }
+
+      // =====================================================
+      // MODE 2: Swing BOS -- needs H1 OR M15 bias alignment
+      // (either one confirms, not both required)
+      // =====================================================
+      ENUM_SIGNAL_DIRECTION swDir = SIGNAL_NONE;
+      double swWick = 0; datetime swTime = 0;
+      if(CheckSwingSweep(swDir, swWick, swTime)) {
+         ENUM_HTF_BIAS h1bias  = GetH1Bias();
+         ENUM_HTF_BIAS m15bias = GetM15Bias();
+
+         bool h1Match  = (swDir == SIGNAL_BUY && h1bias  == BIAS_BULLISH) ||
+                         (swDir == SIGNAL_SELL && h1bias  == BIAS_BEARISH);
+         bool m15Match = (swDir == SIGNAL_BUY && m15bias == BIAS_BULLISH) ||
+                         (swDir == SIGNAL_SELL && m15bias == BIAS_BEARISH);
+
+         if(!h1Match && !m15Match) {
+            Print("[", m_symbol, "] Swing BOS skipped: no HTF alignment H1=",
+                  (h1bias == BIAS_BULLISH ? "BULL" : (h1bias == BIAS_BEARISH ? "BEAR" : "NONE")),
+                  " M15=",
+                  (m15bias == BIAS_BULLISH ? "BULL" : (m15bias == BIAS_BEARISH ? "BEAR" : "NONE")));
+            return false;
+         }
+
+         if(TryBuildFromSweep(swDir, swWick, swTime, session, SETUP_SWING_BOS))
+            return true;
+         m_setup.direction    = swDir;
+         m_setup.phase        = PHASE_SWEPT;
+         m_setup.sweepWickTip = swWick;
+         m_setup.setupType    = SETUP_SWING_BOS;
+         m_asia.sweepTime     = swTime;
+         return false;
       }
 
       return false;
@@ -587,10 +695,6 @@ public:
    SSetup       GetSetup()       { return m_setup; }
    SAsiaLevels  GetAsiaLevels()  { return m_asia; }
    bool         HasSetup()       { return (m_setup.phase == PHASE_CONFIRMED); }
-   bool         IsInKillzone()   {
-      ENUM_SESSION s = GetCurrentSession();
-      return (s == SESSION_LONDON_KILL || s == SESSION_NY_KILL);
-   }
    ENUM_SESSION GetSession()     { return GetCurrentSession(); }
    string       GetSessionName() {
       switch(GetCurrentSession()) {
@@ -601,32 +705,31 @@ public:
       }
    }
 
-   void OnTradePlaced() { m_setup.phase = PHASE_IN_TRADE; }
+   void OnTradePlaced() {
+      m_setup.phase  = PHASE_IN_TRADE;
+      m_lastTradeBar = iTime(m_symbol, m_tf, 0);
+   }
 
-   void OnTradeClose() { m_setup.phase = PHASE_WATCHING; }
+   void OnTradeClose() {
+      m_setup.phase = PHASE_WATCHING;
+   }
 
    void ResetSession() {
-      m_setup.phase = PHASE_WATCHING;
+      if(m_setup.phase != PHASE_IN_TRADE)
+         m_setup.phase = PHASE_WATCHING;
       m_asia.highSwept = false;
       m_asia.lowSwept  = false;
-      Print("[", m_symbol, "] Session reset");
+      for(int i = 0; i < m_shCount; i++) m_swingHighs[i].swept = false;
+      for(int i = 0; i < m_slCount; i++) m_swingLows[i].swept  = false;
    }
 
    void ResetDay() {
-      ZeroMemory(m_asia);
-      ZeroMemory(m_setup);
+      ZeroMemory(m_asia); ZeroMemory(m_setup);
       m_setup.phase = PHASE_IDLE;
+      m_shCount = 0; m_slCount = 0;
+      m_lastSwingUpdate = 0; m_lastTradeBar = 0;
       m_gmtOffsetSec = DetectGMTOffset();
-      Print("[", m_symbol, "] New day reset");
-   }
-
-   bool IsFVGStillValid() {
-      if(m_setup.phase != PHASE_CONFIRMED) return false;
-      double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
-      if(m_setup.direction == SIGNAL_BUY)
-         return (bid > m_setup.stopLoss);
-      else
-         return (bid < m_setup.stopLoss);
+      Print("[", m_symbol, "] Day reset");
    }
 
    double GetCurrentATR() { return GetATR(m_tf, 14); }

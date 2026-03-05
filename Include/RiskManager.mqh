@@ -1,6 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               RiskManager.mqh   |
-//|              Risk Management for SMC Scalper EA v4.0            |
+//|              Risk Management for SMC Scalper EA v6.0            |
+//|                                                                  |
+//|  Philosophy: ONE hard daily loss cap. No pausing. No complex    |
+//|  drawdown tracking. Let the strategy trade freely within the    |
+//|  daily risk budget. Gentle size reduction after losing streaks. |
 //+------------------------------------------------------------------+
 #ifndef RISKMANAGER_MQH
 #define RISKMANAGER_MQH
@@ -18,6 +22,8 @@ private:
    int            m_tradesOpened;
    bool           m_dailyTargetHit;
    bool           m_dailyLossHit;
+   bool           m_ignoreDailyTarget;
+   bool           m_emergencyStop;
 
    datetime GetGMTDate() {
       MqlDateTime dt;
@@ -36,16 +42,19 @@ private:
          m_tradesOpened    = 0;
          m_dailyTargetHit  = false;
          m_dailyLossHit    = false;
-         if(m_streak.pauseUntil > 0 && m_streak.pauseUntil < TimeGMT())
-            m_streak.pauseUntil = 0;
+         m_emergencyStop   = false;
+         m_streak.consecutiveLosses = 0;
+         m_streak.consecutiveWins   = 0;
+         m_streak.sizeMult          = 1.0;
          Print("[Risk] New day. Balance: $", DoubleToString(m_dayStartBalance, 2));
       }
    }
 
 public:
-   CRiskManager(double riskPct = 2.0, double maxDailyLoss = 6.0,
+   CRiskManager(double riskPct = 2.0, double maxDailyLoss = 10.0,
                 double maxDailyProfit = 10.0, double maxDrawdown = 20.0,
-                int maxTradesDay = 4) {
+                int maxTradesDay = 8, bool ignoreDailyTarget = false) {
+      m_ignoreDailyTarget = ignoreDailyTarget;
       m_params.riskPct           = riskPct;
       m_params.maxDailyLossPct   = maxDailyLoss;
       m_params.maxDailyProfitPct = maxDailyProfit;
@@ -63,6 +72,7 @@ public:
       m_tradesOpened    = 0;
       m_dailyTargetHit  = false;
       m_dailyLossHit    = false;
+      m_emergencyStop   = false;
       m_currentDay      = GetGMTDate();
    }
 
@@ -70,6 +80,7 @@ public:
       CheckNewDay();
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
       m_dayPnL = equity - m_dayStartBalance;
+
       double pct = 0;
       if(m_dayStartBalance > 0)
          pct = (m_dayPnL / m_dayStartBalance) * 100.0;
@@ -86,26 +97,44 @@ public:
       }
    }
 
-   bool CanTrade(string &reason) {
-      Update();
-      if(m_streak.pauseUntil > TimeGMT()) {
-         reason = "Streak pause active";
-         return false;
-      }
-      if(m_dailyTargetHit) { reason = "Daily profit target hit"; return false; }
-      if(m_dailyLossHit)   { reason = "Daily loss limit hit";    return false; }
-      if(m_tradesOpened >= m_params.maxTradesPerDay) {
-         reason = "Max trades/day reached";
-         return false;
-      }
+   //==========================================================
+   // EMERGENCY STOP: checked every tick
+   // Triggers when equity drops >= maxDailyLoss% from DAY START
+   // (not from some arbitrary peak)
+   //==========================================================
+   bool CheckEmergencyStop() {
+      if(m_emergencyStop) return true;
+      CheckNewDay();
 
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      double peak   = MathMax(AccountInfoDouble(ACCOUNT_BALANCE), m_dayStartBalance);
-      double dd     = 0;
-      if(peak > 0)
-         dd = ((peak - equity) / peak) * 100.0;
-      if(dd >= m_params.maxDrawdownPct) {
-         reason = "Drawdown limit exceeded";
+      if(m_dayStartBalance <= 0) return false;
+
+      double lossPct = ((m_dayStartBalance - equity) / m_dayStartBalance) * 100.0;
+      if(lossPct >= m_params.maxDailyLossPct) {
+         m_emergencyStop = true;
+         m_dailyLossHit  = true;
+         Print("[Risk] === EMERGENCY STOP === Equity $",
+               DoubleToString(equity, 2), " down ",
+               DoubleToString(lossPct, 1), "% from day start $",
+               DoubleToString(m_dayStartBalance, 2));
+         return true;
+      }
+      return false;
+   }
+
+   bool CanTrade(string &reason) {
+      Update();
+      if(m_emergencyStop) {
+         reason = "Emergency stop - daily loss limit";
+         return false;
+      }
+      if(m_dailyTargetHit && !m_ignoreDailyTarget) {
+         reason = "Daily profit target hit";
+         return false;
+      }
+      if(m_dailyLossHit) { reason = "Daily loss limit hit"; return false; }
+      if(!m_ignoreDailyTarget && m_tradesOpened >= m_params.maxTradesPerDay) {
+         reason = "Max trades/day reached";
          return false;
       }
 
@@ -121,9 +150,9 @@ public:
 
    void OnTradeOpened() {
       m_tradesOpened++;
-      Print("[Risk] Trade opened. Today: ",
-            IntegerToString(m_tradesOpened), "/",
-            IntegerToString(m_params.maxTradesPerDay));
+      Print("[Risk] Trade #", IntegerToString(m_tradesOpened),
+            "/", IntegerToString(m_params.maxTradesPerDay),
+            " size x", DoubleToString(m_streak.sizeMult, 2));
    }
 
    double CalculateLot(string symbol, double entry, double sl) {
@@ -148,11 +177,6 @@ public:
       lot = MathFloor(lot / lotStep) * lotStep;
       lot = MathMax(minLot, MathMin(maxLot, lot));
 
-      Print("[Risk] Lot: Bal=$", DoubleToString(balance, 2),
-            " Risk=", DoubleToString(m_params.riskPct, 1), "%",
-            " x", DoubleToString(m_streak.sizeMult, 1),
-            " SLdist=", DoubleToString(slDist, 5),
-            " -> ", DoubleToString(lot, 2), " lots");
       return lot;
    }
 
@@ -161,26 +185,22 @@ public:
       if(pnl < 0) {
          m_streak.consecutiveLosses++;
          m_streak.consecutiveWins = 0;
-         m_streak.recoveryWins = 0;
-         if(m_streak.consecutiveLosses >= LOSSES_PAUSE) {
-            m_streak.pauseUntil = TimeGMT() + PAUSE_HOURS * 3600;
-            m_streak.sizeMult   = 0.5;
-            Print("[Risk] ", IntegerToString(m_streak.consecutiveLosses),
-                  " losses - pausing ", IntegerToString(PAUSE_HOURS), "h, size 50%");
-         } else if(m_streak.consecutiveLosses >= LOSSES_REDUCE) {
+         if(m_streak.consecutiveLosses >= LOSSES_HALF) {
             m_streak.sizeMult = 0.5;
             Print("[Risk] ", IntegerToString(m_streak.consecutiveLosses),
-                  " losses - size reduced to 50%");
+                  " consecutive losses - size at 50%");
+         } else if(m_streak.consecutiveLosses >= LOSSES_REDUCE) {
+            m_streak.sizeMult = 0.75;
+            Print("[Risk] ", IntegerToString(m_streak.consecutiveLosses),
+                  " consecutive losses - size at 75%");
          }
       } else if(pnl > 0) {
          m_streak.consecutiveWins++;
-         m_streak.recoveryWins++;
+         if(m_streak.consecutiveLosses > 0)
+            Print("[Risk] Win after ", IntegerToString(m_streak.consecutiveLosses),
+                  " losses - restoring full size");
          m_streak.consecutiveLosses = 0;
-         if(m_streak.sizeMult < 1.0 && m_streak.recoveryWins >= RECOVERY_WINS) {
-            m_streak.sizeMult     = 1.0;
-            m_streak.recoveryWins = 0;
-            Print("[Risk] Recovery complete - full size restored");
-         }
+         m_streak.sizeMult = 1.0;
       }
    }
 
@@ -192,9 +212,9 @@ public:
    }
    double GetStartBal()     { return m_dayStartBalance; }
    int    GetTradesToday()  { return m_tradesOpened; }
-   bool   IsDailyDone()     { return (m_dailyTargetHit || m_dailyLossHit); }
+   bool   IsDailyDone()     { return (m_dailyTargetHit || m_dailyLossHit || m_emergencyStop); }
    bool   IsTargetHit()     { return m_dailyTargetHit; }
-   bool   IsLossHit()       { return m_dailyLossHit; }
+   bool   IsLossHit()       { return (m_dailyLossHit || m_emergencyStop); }
    double GetSizeMult()     { return m_streak.sizeMult; }
    int    GetLosses()       { return m_streak.consecutiveLosses; }
    int    GetWins()         { return m_streak.consecutiveWins; }
