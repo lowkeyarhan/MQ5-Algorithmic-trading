@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                               TradeManager.mqh  |
-//|              Trade Execution for SMC Scalper EA v6.0            |
+//|              Trade Execution for SMC Scalper EA v7.0            |
 //|                                                                  |
-//|  v6.0: BE at 1.3R, Partial 40% at 2R, Trail after 2.5R        |
-//|  Lets winners develop before protecting profit.                  |
+//|  v7.0: BE at 1.5R, Partial 25% at 2.5R, Trail 1.5R distance.  |
+//|  Let winners develop. Wider trail prevents premature stops.      |
 //+------------------------------------------------------------------+
 #ifndef TRADEMANAGER_MQH
 #define TRADEMANAGER_MQH
@@ -268,9 +268,9 @@ public:
 
          SetupTradeForSymbol(symbol);
 
-         // BREAKEVEN at BE_R_LEVEL (1.3R)
+         // BREAKEVEN at BE_R_LEVEL (1.5R)
          if(m_useBreakeven && rMultiple >= BE_R_LEVEL) {
-            double beBuf = point * 3;
+            double beBuf = point * 5;
             double newSL;
             if(isBuy)
                newSL = NormalizeDouble(openP + beBuf, digits);
@@ -286,7 +286,7 @@ public:
             }
          }
 
-         // PARTIAL CLOSE at PARTIAL_R_LEVEL (2.0R)
+         // PARTIAL CLOSE at PARTIAL_R_LEVEL (2.5R)
          if(m_usePartial && rMultiple >= PARTIAL_R_LEVEL && !IsPartialDone(ticket)) {
             double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
             double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
@@ -305,9 +305,9 @@ public:
             }
          }
 
-         // TRAIL at 1R distance after TRAIL_R_START (2.5R)
+         // TRAIL at TRAIL_R_DISTANCE behind price, starting at TRAIL_R_START
          if(m_useTrail && rMultiple >= TRAIL_R_START) {
-            double trailDist = slDist;
+            double trailDist = slDist * TRAIL_R_DISTANCE;
             if(isBuy) {
                double newSL = NormalizeDouble(currentPrice - trailDist, digits);
                if(newSL > sl + point) {

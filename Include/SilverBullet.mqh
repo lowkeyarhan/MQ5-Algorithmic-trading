@@ -1,18 +1,15 @@
 //+------------------------------------------------------------------+
 //|                                               SilverBullet.mqh  |
-//|         SMC Structure + Liquidity Sweep Scalp Engine v6.0       |
+//|         SMC Structure + Liquidity Sweep Scalp Engine v7.0       |
 //|                                                                  |
-//|  TWO SETUP MODES:                                                |
-//|  MODE 1: Asia sweep -- highest probability, no bias filter      |
-//|  MODE 2: Swing BOS  -- needs H1 OR M15 alignment (not both)    |
-//|                                                                  |
-//|  v6.0 CHANGES:                                                   |
-//|  - Asia sweeps taken regardless of H1 bias (they ARE reversals) |
-//|  - Swing BOS needs EITHER H1 or M15 agreement (not both)       |
-//|  - Displacement 0.5x ATR (was 0.6 -- too strict)               |
-//|  - Swing lookback 4 (was 5)                                     |
-//|  - Cooldown 5 bars = 25 min (was 8 = 40 min)                   |
-//|  - No OTE fallback (kept from v5.1)                              |
+//|  v7.0 COMPLETE OVERHAUL -- Quality over quantity:               |
+//|  - CHoCH/BOS REQUIRED after every sweep (biggest win rate fix)  |
+//|  - H1 bias using swing structure (HH/HL/LH/LL), not EMA noise  |
+//|  - H1 OR M15 bias required for ALL trades (Asia + Swing)       |
+//|  - FVG-only entries with proper OB fallback (no random candles) |
+//|  - FVG search from sweep forward (closest to sweep = best RR)  |
+//|  - Asia range filter (reject noise/overextended sessions)       |
+//|  - Tighter displacement (0.7x ATR), sweep thresholds, spreads  |
 //+------------------------------------------------------------------+
 #ifndef SILVERBULLET_MQH
 #define SILVERBULLET_MQH
@@ -39,7 +36,6 @@ private:
    int              m_shCount;
    int              m_slCount;
    datetime         m_lastSwingUpdate;
-
    datetime         m_lastTradeBar;
 
    double PipsToPrice(double pips)      { return pips * m_pipSize; }
@@ -102,60 +98,116 @@ private:
    }
 
    //==========================================================
-   // H1 BIAS
+   // H1 BIAS -- swing structure analysis (HH/HL = bull, LH/LL = bear)
    //==========================================================
    ENUM_HTF_BIAS GetH1Bias() {
-      double c1 = iClose(m_symbol, m_biasTF, 1);
-      double c2 = iClose(m_symbol, m_biasTF, 2);
-      double c3 = iClose(m_symbol, m_biasTF, 3);
-      double hi1 = iHigh(m_symbol, m_biasTF, 1);
-      double lo1 = iLow(m_symbol, m_biasTF, 1);
-      double hi2 = iHigh(m_symbol, m_biasTF, 2);
-      double lo2 = iLow(m_symbol, m_biasTF, 2);
-      if(c1 <= 0 || c2 <= 0) return BIAS_NONE;
+      int lb = 3;
+      int maxBars = MathMin(iBars(m_symbol, m_biasTF) - lb - 1, 60);
+      if(maxBars < lb + 3) return BIAS_NONE;
 
-      double ema[];
-      ArraySetAsSeries(ema, true);
-      int emaH = iMA(m_symbol, m_biasTF, 21, 0, MODE_EMA, PRICE_CLOSE);
-      if(emaH != INVALID_HANDLE) {
-         if(CopyBuffer(emaH, 0, 0, 3, ema) >= 2) {
-            IndicatorRelease(emaH);
-            if(c1 > ema[1] && hi1 > hi2) return BIAS_BULLISH;
-            if(c1 < ema[1] && lo1 < lo2) return BIAS_BEARISH;
-            if(c1 > ema[1]) return BIAS_BULLISH;
-            if(c1 < ema[1]) return BIAS_BEARISH;
-         } else {
-            IndicatorRelease(emaH);
+      double sh[];
+      double sl[];
+      ArrayResize(sh, 2);
+      ArrayResize(sl, 2);
+      int shC = 0, slC = 0;
+
+      for(int i = lb; i < maxBars && (shC < 2 || slC < 2); i++) {
+         double hi = iHigh(m_symbol, m_biasTF, i);
+         if(shC < 2) {
+            bool isSwH = true;
+            for(int j = 1; j <= lb; j++) {
+               if(iHigh(m_symbol, m_biasTF, i - j) >= hi ||
+                  iHigh(m_symbol, m_biasTF, i + j) >= hi) {
+                  isSwH = false; break;
+               }
+            }
+            if(isSwH) sh[shC++] = hi;
+         }
+
+         double lo = iLow(m_symbol, m_biasTF, i);
+         if(slC < 2) {
+            bool isSwL = true;
+            for(int j = 1; j <= lb; j++) {
+               if(iLow(m_symbol, m_biasTF, i - j) <= lo ||
+                  iLow(m_symbol, m_biasTF, i + j) <= lo) {
+                  isSwL = false; break;
+               }
+            }
+            if(isSwL) sl[slC++] = lo;
          }
       }
-      if(c1 > c3) return BIAS_BULLISH;
-      if(c1 < c3) return BIAS_BEARISH;
+
+      if(shC >= 2 && slC >= 2) {
+         if(sh[0] > sh[1] && sl[0] > sl[1]) return BIAS_BULLISH;
+         if(sh[0] < sh[1] && sl[0] < sl[1]) return BIAS_BEARISH;
+      }
+
+      double c1 = iClose(m_symbol, m_biasTF, 1);
+      double ema[];
+      ArraySetAsSeries(ema, true);
+      int emaH = iMA(m_symbol, m_biasTF, 50, 0, MODE_EMA, PRICE_CLOSE);
+      if(emaH != INVALID_HANDLE) {
+         int copied = CopyBuffer(emaH, 0, 0, 3, ema);
+         IndicatorRelease(emaH);
+         if(copied >= 3) {
+            bool rising  = (ema[0] > ema[1] && ema[1] > ema[2]);
+            bool falling = (ema[0] < ema[1] && ema[1] < ema[2]);
+            if(c1 > ema[1] && rising)  return BIAS_BULLISH;
+            if(c1 < ema[1] && falling) return BIAS_BEARISH;
+         }
+      }
       return BIAS_NONE;
    }
 
    //==========================================================
-   // M15 STRUCTURE DIRECTION
+   // M15 BIAS -- swing structure analysis
    //==========================================================
    ENUM_HTF_BIAS GetM15Bias() {
-      double c1 = iClose(m_symbol, m_htf, 1);
-      double c2 = iClose(m_symbol, m_htf, 2);
-      double c3 = iClose(m_symbol, m_htf, 3);
-      if(c1 <= 0 || c2 <= 0 || c3 <= 0) return BIAS_NONE;
+      int lb = 2;
+      int maxBars = MathMin(iBars(m_symbol, m_htf) - lb - 1, 40);
+      if(maxBars < lb + 3) return BIAS_NONE;
 
-      double hi1 = iHigh(m_symbol, m_htf, 1);
-      double lo1 = iLow(m_symbol, m_htf, 1);
-      double hi2 = iHigh(m_symbol, m_htf, 2);
-      double lo2 = iLow(m_symbol, m_htf, 2);
+      double sh[];
+      double sl[];
+      ArrayResize(sh, 2);
+      ArrayResize(sl, 2);
+      int shC = 0, slC = 0;
 
-      if(c1 > c3 && hi1 > hi2) return BIAS_BULLISH;
-      if(c1 < c3 && lo1 < lo2) return BIAS_BEARISH;
-      if(c1 > c3) return BIAS_BULLISH;
-      if(c1 < c3) return BIAS_BEARISH;
+      for(int i = lb; i < maxBars && (shC < 2 || slC < 2); i++) {
+         double hi = iHigh(m_symbol, m_htf, i);
+         if(shC < 2) {
+            bool isSwH = true;
+            for(int j = 1; j <= lb; j++) {
+               if(iHigh(m_symbol, m_htf, i - j) >= hi ||
+                  iHigh(m_symbol, m_htf, i + j) >= hi) {
+                  isSwH = false; break;
+               }
+            }
+            if(isSwH) sh[shC++] = hi;
+         }
+
+         double lo = iLow(m_symbol, m_htf, i);
+         if(slC < 2) {
+            bool isSwL = true;
+            for(int j = 1; j <= lb; j++) {
+               if(iLow(m_symbol, m_htf, i - j) <= lo ||
+                  iLow(m_symbol, m_htf, i + j) <= lo) {
+                  isSwL = false; break;
+               }
+            }
+            if(isSwL) sl[slC++] = lo;
+         }
+      }
+
+      if(shC >= 2 && slC >= 2) {
+         if(sh[0] > sh[1] && sl[0] > sl[1]) return BIAS_BULLISH;
+         if(sh[0] < sh[1] && sl[0] < sl[1]) return BIAS_BEARISH;
+      }
       return BIAS_NONE;
    }
 
    //==========================================================
-   // SWING STRUCTURE DETECTION
+   // M5 SWING STRUCTURE
    //==========================================================
    void UpdateSwingStructure() {
       datetime currentBar = iTime(m_symbol, m_tf, 0);
@@ -164,14 +216,15 @@ private:
 
       int lb = SWING_LOOKBACK;
       int totalBars = iBars(m_symbol, m_tf);
-      int scanBars = MathMin(totalBars - 1, 80);
+      int scanBars = MathMin(totalBars - 1, 100);
 
       m_shCount = 0;
       m_slCount = 0;
       ArrayResize(m_swingHighs, MAX_SWING_POINTS);
       ArrayResize(m_swingLows,  MAX_SWING_POINTS);
 
-      double minRange = m_isGold ? PipsToPrice(MIN_SWING_RANGE_GOLD) : PipsToPrice(MIN_SWING_RANGE_FX);
+      double minRange = m_isGold ? PipsToPrice(MIN_SWING_RANGE_GOLD)
+                                 : PipsToPrice(MIN_SWING_RANGE_FX);
 
       for(int i = lb; i < scanBars - lb; i++) {
          if(m_shCount >= MAX_SWING_POINTS && m_slCount >= MAX_SWING_POINTS)
@@ -185,8 +238,7 @@ private:
             for(int j = 1; j <= lb; j++) {
                if(iHigh(m_symbol, m_tf, i - j) >= hi ||
                   iHigh(m_symbol, m_tf, i + j) >= hi) {
-                  isSwingHi = false;
-                  break;
+                  isSwingHi = false; break;
                }
             }
             if(isSwingHi) {
@@ -211,8 +263,7 @@ private:
             for(int j = 1; j <= lb; j++) {
                if(iLow(m_symbol, m_tf, i - j) <= lo ||
                   iLow(m_symbol, m_tf, i + j) <= lo) {
-                  isSwingLo = false;
-                  break;
+                  isSwingLo = false; break;
                }
             }
             if(isSwingLo) {
@@ -262,9 +313,6 @@ private:
                sweepDir  = SIGNAL_SELL;
                sweepWick = hi;
                sweepTime = iTime(m_symbol, m_tf, i);
-               Print("[", m_symbol, "] SWING HI SWEEP bar[", IntegerToString(i),
-                     "] lvl=", DoubleToString(m_swingHighs[s].price, 2),
-                     " age=", IntegerToString(m_swingHighs[s].barIndex - i), "b");
                return true;
             }
          }
@@ -279,9 +327,6 @@ private:
                sweepDir  = SIGNAL_BUY;
                sweepWick = lo;
                sweepTime = iTime(m_symbol, m_tf, i);
-               Print("[", m_symbol, "] SWING LO SWEEP bar[", IntegerToString(i),
-                     "] lvl=", DoubleToString(m_swingLows[s].price, 2),
-                     " age=", IntegerToString(m_swingLows[s].barIndex - i), "b");
                return true;
             }
          }
@@ -290,7 +335,7 @@ private:
    }
 
    //==========================================================
-   // ASIA MAPPING + SWEEP
+   // ASIA MAPPING WITH RANGE FILTER
    //==========================================================
    void MapAsiaLevels() {
       datetime today = GetGMTDate();
@@ -325,11 +370,27 @@ private:
             counted++;
          }
       }
+
       if(counted >= 3 && m_asia.high > 0 && m_asia.low > 0 && m_asia.high > m_asia.low) {
+         double rangePips = PriceToPips(m_asia.high - m_asia.low);
+         double minRange = m_isGold ? MIN_ASIA_RANGE_GOLD : MIN_ASIA_RANGE_FX;
+         double maxRange = m_isGold ? MAX_ASIA_RANGE_GOLD : MAX_ASIA_RANGE_FX;
+
+         if(rangePips < minRange) {
+            Print("[", m_symbol, "] Asia range too small: ",
+                  DoubleToString(rangePips, 1), "p (min ", DoubleToString(minRange, 0), ")");
+            return;
+         }
+         if(rangePips > maxRange) {
+            Print("[", m_symbol, "] Asia range too large: ",
+                  DoubleToString(rangePips, 1), "p (max ", DoubleToString(maxRange, 0), ")");
+            return;
+         }
+
          m_asia.valid = true;
          Print("[", m_symbol, "] Asia: Hi=", DoubleToString(m_asia.high, 2),
                " Lo=", DoubleToString(m_asia.low, 2),
-               " Range=", DoubleToString(PriceToPips(m_asia.high-m_asia.low), 1), "p");
+               " Range=", DoubleToString(rangePips, 1), "p");
       }
    }
 
@@ -352,7 +413,8 @@ private:
             if(pierce >= sweepMin && pierce <= sweepMax && cl <= m_asia.high) {
                m_asia.highSwept = true;
                sweepDir = SIGNAL_SELL; sweepWick = hi; sweepTime = iTime(m_symbol, m_tf, i);
-               Print("[", m_symbol, "] ASIA HI SWEEP bar[", IntegerToString(i), "]");
+               Print("[", m_symbol, "] ASIA HI SWEEP bar[", IntegerToString(i),
+                     "] pierce=", DoubleToString(PriceToPips(pierce), 1), "p");
                return true;
             }
          }
@@ -361,76 +423,9 @@ private:
             if(pierce >= sweepMin && pierce <= sweepMax && cl >= m_asia.low) {
                m_asia.lowSwept = true;
                sweepDir = SIGNAL_BUY; sweepWick = lo; sweepTime = iTime(m_symbol, m_tf, i);
-               Print("[", m_symbol, "] ASIA LO SWEEP bar[", IntegerToString(i), "]");
+               Print("[", m_symbol, "] ASIA LO SWEEP bar[", IntegerToString(i),
+                     "] pierce=", DoubleToString(PriceToPips(pierce), 1), "p");
                return true;
-            }
-         }
-      }
-      return false;
-   }
-
-   //==========================================================
-   // FVG / OB DETECTION -- NO OTE FALLBACK
-   //==========================================================
-   bool DetectFVGorOB(ENUM_SIGNAL_DIRECTION dir, datetime afterTime, SFVG &fvg) {
-      double atr = GetATR(m_tf, 14);
-      if(atr <= 0) return false;
-      double minBody = atr * DISP_ATR_MULT;
-      int maxBars = MathMin(iBars(m_symbol, m_tf) - 2, 20);
-
-      for(int i = 1; i < maxBars; i++) {
-         datetime barT = iTime(m_symbol, m_tf, i);
-         if(barT <= afterTime) continue;
-
-         double op = iOpen(m_symbol,  m_tf, i);
-         double hi = iHigh(m_symbol,  m_tf, i);
-         double lo = iLow(m_symbol,   m_tf, i);
-         double cl = iClose(m_symbol, m_tf, i);
-         double body = MathAbs(cl - op);
-
-         if(dir == SIGNAL_BUY) {
-            if(cl <= op || body < minBody) continue;
-            if(i + 1 < maxBars && i - 1 >= 0) {
-               double prevH = iHigh(m_symbol, m_tf, i + 1);
-               double nextL = iLow(m_symbol,  m_tf, i - 1);
-               if(prevH < nextL) {
-                  fvg.isBullish = true; fvg.lower = prevH; fvg.upper = nextL;
-                  fvg.midpoint = (prevH + nextL) / 2.0; fvg.time = barT; fvg.active = true;
-                  return true;
-               }
-            }
-            for(int j = i + 1; j < i + 5 && j < maxBars; j++) {
-               double oc = iClose(m_symbol, m_tf, j);
-               double oo = iOpen(m_symbol,  m_tf, j);
-               double ol = iLow(m_symbol,   m_tf, j);
-               if(oc < oo) {
-                  fvg.isBullish = true; fvg.lower = ol; fvg.upper = oo;
-                  fvg.midpoint = (ol + oo) / 2.0; fvg.time = iTime(m_symbol, m_tf, j); fvg.active = true;
-                  return true;
-               }
-            }
-         }
-
-         if(dir == SIGNAL_SELL) {
-            if(cl >= op || body < minBody) continue;
-            if(i + 1 < maxBars && i - 1 >= 0) {
-               double prevL = iLow(m_symbol,  m_tf, i + 1);
-               double nextH = iHigh(m_symbol, m_tf, i - 1);
-               if(prevL > nextH) {
-                  fvg.isBullish = false; fvg.upper = prevL; fvg.lower = nextH;
-                  fvg.midpoint = (prevL + nextH) / 2.0; fvg.time = barT; fvg.active = true;
-                  return true;
-               }
-            }
-            for(int j = i + 1; j < i + 5 && j < maxBars; j++) {
-               double oc = iClose(m_symbol, m_tf, j);
-               double oo = iOpen(m_symbol,  m_tf, j);
-               double oh = iHigh(m_symbol,  m_tf, j);
-               if(oc > oo) {
-                  fvg.isBullish = false; fvg.upper = oh; fvg.lower = oo;
-                  fvg.midpoint = (oh + oo) / 2.0; fvg.time = iTime(m_symbol, m_tf, j); fvg.active = true;
-                  return true;
-               }
             }
          }
       }
@@ -449,6 +444,148 @@ private:
       else if(m_isBTC) maxP = MAX_SPREAD_PIPS_BTC;
       else maxP = MAX_SPREAD_PIPS_FX;
       return (spPips <= maxP);
+   }
+
+   //==========================================================
+   // FIND STRUCTURE LEVEL FOR CHoCH
+   // After a low sweep (BUY), finds the nearest high to break above
+   // After a high sweep (SELL), finds the nearest low to break below
+   //==========================================================
+   bool FindStructureLevel(ENUM_SIGNAL_DIRECTION dir, datetime sweepTime, double &level) {
+      int sweepIdx = -1;
+      for(int i = 1; i < 25; i++) {
+         datetime bt = iTime(m_symbol, m_tf, i);
+         if(bt <= sweepTime) { sweepIdx = i; break; }
+      }
+      if(sweepIdx < 1) return false;
+
+      int end = MathMin(sweepIdx + 6, iBars(m_symbol, m_tf) - 1);
+
+      if(dir == SIGNAL_BUY) {
+         double best = 0;
+         for(int i = sweepIdx; i <= end; i++) {
+            double h = iHigh(m_symbol, m_tf, i);
+            if(h > best) best = h;
+         }
+         level = best;
+         return (best > 0);
+      } else {
+         double best = DBL_MAX;
+         for(int i = sweepIdx; i <= end; i++) {
+            double l = iLow(m_symbol, m_tf, i);
+            if(l < best) best = l;
+         }
+         level = best;
+         return (best < DBL_MAX);
+      }
+   }
+
+   //==========================================================
+   // FVG DETECTION WITH CHoCH REQUIREMENT
+   // The displacement candle must:
+   //   1. Have body >= DISP_ATR_MULT * ATR (strong displacement)
+   //   2. Close beyond the structure level (CHoCH confirmed)
+   //   3. Create a true FVG or serve as the basis for a proper OB
+   // Search from sweep time forward (closest FVG = best entry)
+   //==========================================================
+   bool DetectFVGWithCHoCH(ENUM_SIGNAL_DIRECTION dir, datetime sweepTime,
+                            double structureLevel, SFVG &fvg) {
+      double atr = GetATR(m_tf, 14);
+      if(atr <= 0) return false;
+      double minBody = atr * DISP_ATR_MULT;
+      int maxBars = MathMin(iBars(m_symbol, m_tf) - 2, 20);
+
+      for(int i = maxBars - 1; i >= 2; i--) {
+         datetime barT = iTime(m_symbol, m_tf, i);
+         if(barT <= sweepTime) continue;
+
+         double op = iOpen(m_symbol,  m_tf, i);
+         double hi = iHigh(m_symbol,  m_tf, i);
+         double lo = iLow(m_symbol,   m_tf, i);
+         double cl = iClose(m_symbol, m_tf, i);
+         double body = MathAbs(cl - op);
+
+         if(dir == SIGNAL_BUY) {
+            if(cl <= op || body < minBody) continue;
+            if(cl <= structureLevel) continue;
+
+            if(i + 1 < maxBars) {
+               double prevH = iHigh(m_symbol, m_tf, i + 1);
+               double nextL = iLow(m_symbol,  m_tf, i - 1);
+               if(prevH < nextL) {
+                  fvg.isBullish = true;
+                  fvg.lower = prevH;
+                  fvg.upper = nextL;
+                  fvg.midpoint = (prevH + nextL) / 2.0;
+                  fvg.time = barT;
+                  fvg.active = true;
+                  Print("[", m_symbol, "] BUY FVG found: ",
+                        DoubleToString(fvg.lower, 5), "-", DoubleToString(fvg.upper, 5),
+                        " CHoCH above ", DoubleToString(structureLevel, 5));
+                  return true;
+               }
+            }
+
+            if(i + 1 < maxBars) {
+               double obO = iOpen(m_symbol,  m_tf, i + 1);
+               double obC = iClose(m_symbol, m_tf, i + 1);
+               double obBody = MathAbs(obO - obC);
+               if(obC < obO && obBody > atr * 0.15) {
+                  fvg.isBullish = true;
+                  fvg.lower = obC;
+                  fvg.upper = obO;
+                  fvg.midpoint = (obC + obO) / 2.0;
+                  fvg.time = iTime(m_symbol, m_tf, i + 1);
+                  fvg.active = true;
+                  Print("[", m_symbol, "] BUY OB found: ",
+                        DoubleToString(fvg.lower, 5), "-", DoubleToString(fvg.upper, 5),
+                        " CHoCH above ", DoubleToString(structureLevel, 5));
+                  return true;
+               }
+            }
+         }
+
+         if(dir == SIGNAL_SELL) {
+            if(cl >= op || body < minBody) continue;
+            if(cl >= structureLevel) continue;
+
+            if(i + 1 < maxBars) {
+               double prevL = iLow(m_symbol,  m_tf, i + 1);
+               double nextH = iHigh(m_symbol, m_tf, i - 1);
+               if(prevL > nextH) {
+                  fvg.isBullish = false;
+                  fvg.upper = prevL;
+                  fvg.lower = nextH;
+                  fvg.midpoint = (prevL + nextH) / 2.0;
+                  fvg.time = barT;
+                  fvg.active = true;
+                  Print("[", m_symbol, "] SELL FVG found: ",
+                        DoubleToString(fvg.lower, 5), "-", DoubleToString(fvg.upper, 5),
+                        " CHoCH below ", DoubleToString(structureLevel, 5));
+                  return true;
+               }
+            }
+
+            if(i + 1 < maxBars) {
+               double obO = iOpen(m_symbol,  m_tf, i + 1);
+               double obC = iClose(m_symbol, m_tf, i + 1);
+               double obBody = MathAbs(obO - obC);
+               if(obC > obO && obBody > atr * 0.15) {
+                  fvg.isBullish = false;
+                  fvg.lower = obO;
+                  fvg.upper = obC;
+                  fvg.midpoint = (obO + obC) / 2.0;
+                  fvg.time = iTime(m_symbol, m_tf, i + 1);
+                  fvg.active = true;
+                  Print("[", m_symbol, "] SELL OB found: ",
+                        DoubleToString(fvg.lower, 5), "-", DoubleToString(fvg.upper, 5),
+                        " CHoCH below ", DoubleToString(structureLevel, 5));
+                  return true;
+               }
+            }
+         }
+      }
+      return false;
    }
 
    //==========================================================
@@ -481,7 +618,8 @@ private:
       double entry = NormalizeDouble(fvg.midpoint, digits);
       double sl;
 
-      double buffer = m_isGold ? PipsToPrice(1.0) : PipsToPrice(0.5);
+      double buffer = m_isGold ? PipsToPrice(SL_BUFFER_PIPS_GOLD)
+                               : PipsToPrice(SL_BUFFER_PIPS_FX);
 
       if(dir == SIGNAL_BUY) {
          sl = NormalizeDouble(sweepWick - buffer, digits);
@@ -502,7 +640,16 @@ private:
 
       double minSL = m_isGold ? MIN_SL_PIPS_GOLD : MIN_SL_PIPS_FX;
 
-      if(slPips > maxSL || slPips < minSL) return false;
+      if(slPips > maxSL) {
+         Print("[", m_symbol, "] SL too wide: ", DoubleToString(slPips, 1),
+               "p > ", DoubleToString(maxSL, 0));
+         return false;
+      }
+      if(slPips < minSL) {
+         Print("[", m_symbol, "] SL too tight: ", DoubleToString(slPips, 1),
+               "p < ", DoubleToString(minSL, 1));
+         return false;
+      }
 
       double minTPDist = slDist * TARGET_RR;
       double liq = FindLiquidityTarget(dir, entry, minTPDist);
@@ -515,19 +662,19 @@ private:
 
       double actualRR = MathAbs(tp - entry) / slDist;
 
-      m_setup.direction   = dir;
-      m_setup.entryPrice  = entry;
-      m_setup.stopLoss    = sl;
-      m_setup.takeProfit  = tp;
-      m_setup.riskReward  = actualRR;
-      m_setup.slPips      = slPips;
-      m_setup.fvg         = fvg;
-      m_setup.fvgFound    = true;
-      m_setup.chochDone   = true;
-      m_setup.session     = session;
-      m_setup.setupType   = sType;
-      m_setup.setupTime   = TimeCurrent();
-      m_setup.phase       = PHASE_CONFIRMED;
+      m_setup.direction    = dir;
+      m_setup.entryPrice   = entry;
+      m_setup.stopLoss     = sl;
+      m_setup.takeProfit   = tp;
+      m_setup.riskReward   = actualRR;
+      m_setup.slPips       = slPips;
+      m_setup.fvg          = fvg;
+      m_setup.fvgFound     = true;
+      m_setup.chochDone    = true;
+      m_setup.session      = session;
+      m_setup.setupType    = sType;
+      m_setup.setupTime    = TimeCurrent();
+      m_setup.phase        = PHASE_CONFIRMED;
       m_setup.sweepWickTip = sweepWick;
 
       string sTypeStr = (sType == SETUP_ASIA_SWEEP) ? "Asia" : "Swing";
@@ -536,7 +683,7 @@ private:
                      + DoubleToString(slPips, 1) + "p RR=1:"
                      + DoubleToString(actualRR, 1);
 
-      Print("[", m_symbol, "] === ", sTypeStr, " SETUP ===");
+      Print("[", m_symbol, "] === ", sTypeStr, " SETUP (CHoCH confirmed) ===");
       Print("[", m_symbol, "] ", dirStr,
             " E=", DoubleToString(entry, digits),
             " SL=", DoubleToString(sl, digits),
@@ -547,14 +694,20 @@ private:
    }
 
    //==========================================================
-   // TRY BUILD FROM SWEEP
+   // TRY BUILD FROM SWEEP (sweep + CHoCH + FVG + setup)
    //==========================================================
    bool TryBuildFromSweep(ENUM_SIGNAL_DIRECTION dir, double sweepWick,
                           datetime sweepTime, ENUM_SESSION session,
                           ENUM_SETUP_TYPE sType) {
+      double structureLevel;
+      if(!FindStructureLevel(dir, sweepTime, structureLevel))
+         return false;
+
       SFVG fvg;
       ZeroMemory(fvg);
-      if(!DetectFVGorOB(dir, sweepTime, fvg)) return false;
+      if(!DetectFVGWithCHoCH(dir, sweepTime, structureLevel, fvg))
+         return false;
+
       return BuildSetup(dir, fvg, sweepWick, session, sType);
    }
 
@@ -581,8 +734,8 @@ public:
       ArrayResize(m_swingHighs, MAX_SWING_POINTS);
       ArrayResize(m_swingLows,  MAX_SWING_POINTS);
 
-      Print("[", symbol, "] v6 engine init pip=", DoubleToString(m_pipSize, 5),
-            " gmt=", IntegerToString(m_gmtOffsetSec/3600), "h");
+      Print("[", symbol, "] v7 engine init pip=", DoubleToString(m_pipSize, 5),
+            " gmt=", IntegerToString(m_gmtOffsetSec / 3600), "h");
    }
 
    //==========================================================
@@ -610,24 +763,20 @@ public:
       if(!m_asia.valid) MapAsiaLevels();
       if(!SpreadOK()) return false;
 
-      // Cooldown
       datetime currentBar = iTime(m_symbol, m_tf, 0);
       if(m_lastTradeBar > 0) {
          int barsSince = (int)((currentBar - m_lastTradeBar) / PeriodSeconds(m_tf));
          if(barsSince < MIN_BARS_BETWEEN_TRADES) return false;
       }
 
-      // Pending swept phase
+      // Pending swept phase: keep looking for CHoCH+FVG
       if(m_setup.phase == PHASE_SWEPT) {
-         SFVG fvg;
-         ZeroMemory(fvg);
-         datetime refTime = (m_asia.sweepTime > 0) ? m_asia.sweepTime : iTime(m_symbol, m_tf, 10);
-         if(DetectFVGorOB(m_setup.direction, refTime, fvg)) {
-            double wick = m_setup.sweepWickTip;
-            ENUM_SETUP_TYPE st = m_setup.setupType;
-            if(BuildSetup(m_setup.direction, fvg, wick, session, st))
-               return true;
-         }
+         datetime refTime = (m_asia.sweepTime > 0) ? m_asia.sweepTime : iTime(m_symbol, m_tf, 15);
+         double wick = m_setup.sweepWickTip;
+         ENUM_SETUP_TYPE st = m_setup.setupType;
+
+         if(TryBuildFromSweep(m_setup.direction, wick, refTime, session, st))
+            return true;
 
          int barsSinceSweep = 0;
          if(m_asia.sweepTime > 0)
@@ -641,13 +790,31 @@ public:
       }
 
       // =====================================================
-      // MODE 1: Asia sweep -- NO bias filter (reversals are the point)
+      // MODE 1: Asia level sweep
+      // REQUIRES H1 OR M15 bias alignment
       // =====================================================
       ENUM_SIGNAL_DIRECTION asiaDir = SIGNAL_NONE;
       double asiaWick = 0; datetime asiaSweepT = 0;
       if(CheckAsiaSweep(asiaDir, asiaWick, asiaSweepT)) {
+         ENUM_HTF_BIAS h1bias  = GetH1Bias();
+         ENUM_HTF_BIAS m15bias = GetM15Bias();
+
+         bool h1Match  = (asiaDir == SIGNAL_BUY && h1bias  == BIAS_BULLISH) ||
+                         (asiaDir == SIGNAL_SELL && h1bias  == BIAS_BEARISH);
+         bool m15Match = (asiaDir == SIGNAL_BUY && m15bias == BIAS_BULLISH) ||
+                         (asiaDir == SIGNAL_SELL && m15bias == BIAS_BEARISH);
+
+         if(!h1Match && !m15Match) {
+            Print("[", m_symbol, "] Asia sweep SKIPPED: no bias alignment H1=",
+                  (h1bias == BIAS_BULLISH ? "BULL" : (h1bias == BIAS_BEARISH ? "BEAR" : "NONE")),
+                  " M15=",
+                  (m15bias == BIAS_BULLISH ? "BULL" : (m15bias == BIAS_BEARISH ? "BEAR" : "NONE")));
+            return false;
+         }
+
          if(TryBuildFromSweep(asiaDir, asiaWick, asiaSweepT, session, SETUP_ASIA_SWEEP))
             return true;
+
          m_setup.direction    = asiaDir;
          m_setup.phase        = PHASE_SWEPT;
          m_setup.sweepWickTip = asiaWick;
@@ -657,8 +824,8 @@ public:
       }
 
       // =====================================================
-      // MODE 2: Swing BOS -- needs H1 OR M15 bias alignment
-      // (either one confirms, not both required)
+      // MODE 2: Swing BOS
+      // REQUIRES H1 OR M15 bias alignment
       // =====================================================
       ENUM_SIGNAL_DIRECTION swDir = SIGNAL_NONE;
       double swWick = 0; datetime swTime = 0;
@@ -672,7 +839,7 @@ public:
                          (swDir == SIGNAL_SELL && m15bias == BIAS_BEARISH);
 
          if(!h1Match && !m15Match) {
-            Print("[", m_symbol, "] Swing BOS skipped: no HTF alignment H1=",
+            Print("[", m_symbol, "] Swing BOS SKIPPED: no bias alignment H1=",
                   (h1bias == BIAS_BULLISH ? "BULL" : (h1bias == BIAS_BEARISH ? "BEAR" : "NONE")),
                   " M15=",
                   (m15bias == BIAS_BULLISH ? "BULL" : (m15bias == BIAS_BEARISH ? "BEAR" : "NONE")));
@@ -681,6 +848,7 @@ public:
 
          if(TryBuildFromSweep(swDir, swWick, swTime, session, SETUP_SWING_BOS))
             return true;
+
          m_setup.direction    = swDir;
          m_setup.phase        = PHASE_SWEPT;
          m_setup.sweepWickTip = swWick;

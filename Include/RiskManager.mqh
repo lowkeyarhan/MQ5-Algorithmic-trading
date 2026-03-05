@@ -1,10 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                               RiskManager.mqh   |
-//|              Risk Management for SMC Scalper EA v6.1            |
+//|              Risk Management for SMC Scalper EA v7.0            |
 //|                                                                  |
-//|  v6.1: No emergency stop killing trades. Daily loss cap only    |
-//|  blocks NEW trades. Open trades run to their SL/TP naturally.   |
-//|  Lot sizing refuses to trade if min lot exceeds risk budget.    |
+//|  v7.0: Realized P&L tracking. No emergency stops. Daily loss    |
+//|  blocks new trades only. Smart lot sizing for small accounts.   |
 //+------------------------------------------------------------------+
 #ifndef RISKMANAGER_MQH
 #define RISKMANAGER_MQH

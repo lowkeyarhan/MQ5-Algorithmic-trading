@@ -1,13 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   ForexEA.mq5   |
-//|              SMC Structure + Liquidity Sweep Scalper v6.1       |
+//|              SMC Structure + Liquidity Sweep Scalper v7.0       |
 //|                                                                  |
-//|  v6.1: No emergency stop. Daily loss blocks new trades only.    |
-//|        Open trades run to SL/TP naturally. Never force-closed.  |
+//|  v7.0: CHoCH required. H1 bias for all. FVG-only. Quality.     |
 //+------------------------------------------------------------------+
 #property copyright "SMC_ScalperEA"
-#property version   "6.1"
-#property description "SMC Scalper | Asia Sweep + Swing BOS | OB/FVG Entry | 1:3 RR Min"
+#property version   "7.0"
+#property description "SMC Scalper | CHoCH + HTF Bias + FVG Entry | 1:3 RR Min"
 #property strict
 
 #include "Include/Defines.mqh"
@@ -35,7 +34,7 @@ input string   InpSep3        = "--- Risk ---";
 input double   InpRiskPct     = 2.0;              // Risk % per trade
 input double   InpMaxDailyLoss = 10.0;            // Max daily loss % (HARD CAP)
 input double   InpMaxDailyProfit = 15.0;          // Daily profit target %
-input int      InpMaxTradesDay = 8;               // Max trades per day
+input int      InpMaxTradesDay = 5;               // Max trades per day
 
 input bool     InpIgnoreDailyTarget = true;        // Ignore daily target (testing only)
 
@@ -79,7 +78,7 @@ string               g_lastReason;
 int OnInit() {
    Print("=================================================");
    Print(EA_NAME, " v", EA_VERSION, " STARTING");
-   Print("Strategy: SMC Asia Sweep + Swing BOS | FVG/OB Entry");
+   Print("Strategy: SMC Sweep + CHoCH + HTF Bias + FVG Entry");
    Print("Sessions: London 07-10 | NY 12-15 GMT");
    Print("Risk: ", DoubleToString(InpRiskPct, 1), "% | DailyLoss: ",
          DoubleToString(InpMaxDailyLoss, 0), "% | RR 1:",

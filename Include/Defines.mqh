@@ -1,7 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                      Defines.mqh |
 //|           SMC Structure + Liquidity Sweep Scalper                |
-//|                     Core Definitions v6.1                        |
+//|                     Core Definitions v7.0                        |
+//|                                                                  |
+//|  v7.0: CHoCH required. H1 bias for all trades. FVG-only entry.  |
+//|        Proper OB fallback. Tighter filters. Quality > quantity.  |
 //+------------------------------------------------------------------+
 #ifndef DEFINES_MQH
 #define DEFINES_MQH
@@ -10,13 +13,6 @@ enum ENUM_SIGNAL_DIRECTION {
    SIGNAL_NONE  =  0,
    SIGNAL_BUY   =  1,
    SIGNAL_SELL  = -1
-};
-
-enum ENUM_EA_STATE {
-   STATE_NORMAL    = 0,
-   STATE_REDUCED   = 1,
-   STATE_PAUSED    = 2,
-   STATE_RECOVERY  = 3
 };
 
 enum ENUM_SESSION {
@@ -128,7 +124,7 @@ struct SStreakControl {
 //  CONSTANTS
 //============================================================
 #define EA_NAME            "SMC_ScalperEA"
-#define EA_VERSION         "6.1.0"
+#define EA_VERSION         "7.0.0"
 #define MAGIC_NUMBER       20250305L
 
 // Killzones (GMT hours)
@@ -141,41 +137,43 @@ struct SStreakControl {
 #define ASIA_H_START   0
 #define ASIA_H_END     7
 
-// Sweep minimums per instrument class
-#define SWEEP_MIN_PIPS_FX    0.5
-#define SWEEP_MIN_PIPS_JPY   0.3
-#define SWEEP_MIN_PIPS_GOLD  0.3
-#define SWEEP_MAX_PIPS_FX   25.0
-#define SWEEP_MAX_PIPS_JPY  25.0
-#define SWEEP_MAX_PIPS_GOLD 300.0
+// Sweep thresholds: tighter to reject noise
+#define SWEEP_MIN_PIPS_FX    1.0
+#define SWEEP_MIN_PIPS_JPY   0.5
+#define SWEEP_MIN_PIPS_GOLD  1.0
+#define SWEEP_MAX_PIPS_FX   15.0
+#define SWEEP_MAX_PIPS_JPY  15.0
+#define SWEEP_MAX_PIPS_GOLD 100.0
 
-// Displacement body >= this fraction of ATR
-#define DISP_ATR_MULT    0.5
+// Displacement: body >= this fraction of ATR (stricter)
+#define DISP_ATR_MULT    0.7
 
 // Minimum R:R
 #define TARGET_RR        3.0
 
-// Max SL in pips
-#define MAX_SL_PIPS_FOREX  15.0
-#define MAX_SL_PIPS_JPY    15.0
-#define MAX_SL_PIPS_GOLD   150.0
+// Max SL in pips (tighter = better RR)
+#define MAX_SL_PIPS_FOREX  12.0
+#define MAX_SL_PIPS_JPY    12.0
+#define MAX_SL_PIPS_GOLD   80.0
 #define MAX_SL_PIPS_BTC    500.0
 
 // Min SL in pips (reject noise setups)
-#define MIN_SL_PIPS_FX     1.0
-#define MIN_SL_PIPS_GOLD   3.0
+#define MIN_SL_PIPS_FX     1.5
+#define MIN_SL_PIPS_GOLD   5.0
 
-// Swing detection: N bars required on each side
-#define SWING_LOOKBACK     4
+// Asia range filter (reject too-small or too-large ranges)
+#define MIN_ASIA_RANGE_FX    3.0
+#define MAX_ASIA_RANGE_FX    40.0
+#define MIN_ASIA_RANGE_GOLD  15.0
+#define MAX_ASIA_RANGE_GOLD  150.0
 
-// Max swing points to track
-#define MAX_SWING_POINTS   20
+// Swing detection
+#define SWING_LOOKBACK     5
+#define MAX_SWING_POINTS   15
+#define MIN_SWING_RANGE_FX    3.0
+#define MIN_SWING_RANGE_GOLD  20.0
 
-// Minimum swing significance in pips
-#define MIN_SWING_RANGE_FX    2.0
-#define MIN_SWING_RANGE_GOLD  10.0
-
-// Streak: reduce size after this many consecutive losses (NO pausing)
+// Streak control (gentle size reduction only)
 #define LOSSES_REDUCE    4
 #define LOSSES_HALF      6
 
@@ -183,21 +181,26 @@ struct SStreakControl {
 #define MARGIN_KILL      150.0
 
 // Max spread (pips)
-#define MAX_SPREAD_PIPS_FX   3.0
-#define MAX_SPREAD_PIPS_GOLD 5.0
+#define MAX_SPREAD_PIPS_FX   2.5
+#define MAX_SPREAD_PIPS_GOLD 4.0
 #define MAX_SPREAD_PIPS_BTC  50.0
 
 // Bars after sweep to find CHoCH/FVG
-#define MAX_BARS_AFTER_SWEEP 12
+#define MAX_BARS_AFTER_SWEEP 10
 
-// Min bars between trades on same pair
-#define MIN_BARS_BETWEEN_TRADES 5
+// Min bars between trades on same pair (= 40 min on M5)
+#define MIN_BARS_BETWEEN_TRADES 8
+
+// SL buffer beyond sweep wick
+#define SL_BUFFER_PIPS_FX    1.0
+#define SL_BUFFER_PIPS_GOLD  2.0
 
 // Trade management R-multiples
-#define BE_R_LEVEL       1.3
-#define PARTIAL_R_LEVEL  2.0
-#define PARTIAL_PCT      0.40
+#define BE_R_LEVEL       1.5
+#define PARTIAL_R_LEVEL  2.5
+#define PARTIAL_PCT      0.25
 #define TRAIL_R_START    2.5
+#define TRAIL_R_DISTANCE 1.5
 
 // Pairs
 #define PAIR_EURUSD  "EURUSD"
