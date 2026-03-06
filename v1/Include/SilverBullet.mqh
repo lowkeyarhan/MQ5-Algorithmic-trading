@@ -447,25 +447,38 @@ private:
    }
 
    //==========================================================
-   // FIND STRUCTURE LEVEL FOR CHoCH
-   // After a low sweep (BUY), finds the nearest high to break above
-   // After a high sweep (SELL), finds the nearest low to break below
+   // FIND STRUCTURE LEVEL FOR CHoCH (FRACTAL BASED)
+   // After a low sweep (BUY), finds the nearest fractal high to break above
+   // After a high sweep (SELL), finds the nearest fractal low to break below
    //==========================================================
    bool FindStructureLevel(ENUM_SIGNAL_DIRECTION dir, datetime sweepTime, double &level) {
       int sweepIdx = -1;
-      for(int i = 1; i < 25; i++) {
+      for(int i = 1; i < 40; i++) {
          datetime bt = iTime(m_symbol, m_tf, i);
          if(bt <= sweepTime) { sweepIdx = i; break; }
       }
       if(sweepIdx < 1) return false;
 
-      int end = MathMin(sweepIdx + 6, iBars(m_symbol, m_tf) - 1);
+      int end = MathMin(sweepIdx + 12, iBars(m_symbol, m_tf) - 3); // Look back further for structure
 
       if(dir == SIGNAL_BUY) {
          double best = 0;
          for(int i = sweepIdx; i <= end; i++) {
             double h = iHigh(m_symbol, m_tf, i);
-            if(h > best) best = h;
+            // Fractal High check: High[i] > High[i-1], High[i] > High[i-2], High[i] > High[i+1], High[i] > High[i+2]
+            if(i >= 2 && i < iBars(m_symbol, m_tf)-2) {
+               if(h > iHigh(m_symbol, m_tf, i-1) && h > iHigh(m_symbol, m_tf, i-2) &&
+                  h > iHigh(m_symbol, m_tf, i+1) && h > iHigh(m_symbol, m_tf, i+2)) {
+                  if(h > best) best = h;
+               }
+            }
+         }
+         // Fallback if no fractal found (use highest high)
+         if(best == 0) {
+             for(int i = sweepIdx; i <= end; i++) {
+                double h = iHigh(m_symbol, m_tf, i);
+                if(h > best) best = h;
+             }
          }
          level = best;
          return (best > 0);
@@ -473,7 +486,20 @@ private:
          double best = DBL_MAX;
          for(int i = sweepIdx; i <= end; i++) {
             double l = iLow(m_symbol, m_tf, i);
-            if(l < best) best = l;
+            // Fractal Low check
+            if(i >= 2 && i < iBars(m_symbol, m_tf)-2) {
+               if(l < iLow(m_symbol, m_tf, i-1) && l < iLow(m_symbol, m_tf, i-2) &&
+                  l < iLow(m_symbol, m_tf, i+1) && l < iLow(m_symbol, m_tf, i+2)) {
+                  if(l < best) best = l;
+               }
+            }
+         }
+         // Fallback
+         if(best == DBL_MAX) {
+             for(int i = sweepIdx; i <= end; i++) {
+                double l = iLow(m_symbol, m_tf, i);
+                if(l < best) best = l;
+             }
          }
          level = best;
          return (best < DBL_MAX);
@@ -762,6 +788,11 @@ public:
       UpdateSwingStructure();
       if(!m_asia.valid) MapAsiaLevels();
       if(!SpreadOK()) return false;
+
+      // v8.0: Time Filter - Avoid last 30 mins of session (rollover risk)
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      if(dt.hour == 23 && dt.min >= 30) return false;
 
       datetime currentBar = iTime(m_symbol, m_tf, 0);
       if(m_lastTradeBar > 0) {

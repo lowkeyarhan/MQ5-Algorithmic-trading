@@ -124,7 +124,7 @@ struct SStreakControl {
 //  CONSTANTS
 //============================================================
 #define EA_NAME            "SMC_ScalperEA"
-#define EA_VERSION         "7.0.0"
+#define EA_VERSION         "8.0.0"
 #define MAGIC_NUMBER       20250305L
 
 // Killzones (GMT hours)
@@ -195,12 +195,12 @@ struct SStreakControl {
 #define SL_BUFFER_PIPS_FX    1.0
 #define SL_BUFFER_PIPS_GOLD  2.0
 
-// Trade management R-multiples
-#define BE_R_LEVEL       1.5
-#define PARTIAL_R_LEVEL  2.5
+// Trade management R-multiples (v8.0: Tighter to secure wins)
+#define BE_R_LEVEL       1.2
+#define PARTIAL_R_LEVEL  2.0
 #define PARTIAL_PCT      0.25
-#define TRAIL_R_START    2.5
-#define TRAIL_R_DISTANCE 1.5
+#define TRAIL_R_START    1.5
+#define TRAIL_R_DISTANCE 1.0
 
 // Pairs
 #define PAIR_EURUSD  "EURUSD"

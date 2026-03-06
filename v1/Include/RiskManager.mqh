@@ -155,10 +155,12 @@ public:
       if(lot < minLot) {
          double minLotLoss = minLot * lossPerLot;
          double minLotRiskPct = (minLotLoss / balance) * 100.0;
-         if(minLotRiskPct > m_params.riskPct * 3.0) {
+         // v8.0: Tighter check for small accounts. Max 1.5x riskPct (e.g. 3% if risk=2%)
+         // Previously 3.0x (6%) was too loose for $20 accounts
+         if(minLotRiskPct > m_params.riskPct * 1.5) {
             Print("[Risk] SKIP ", symbol, ": min lot ", DoubleToString(minLot, 2),
                   " risks ", DoubleToString(minLotRiskPct, 1),
-                  "% (max ", DoubleToString(m_params.riskPct * 3.0, 1),
+                  "% (max ", DoubleToString(m_params.riskPct * 1.5, 1),
                   "%) bal=$", DoubleToString(balance, 2));
             return 0;
          }

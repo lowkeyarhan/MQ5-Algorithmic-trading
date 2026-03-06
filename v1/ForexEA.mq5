@@ -1,11 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   ForexEA.mq5   |
-//|              SMC Structure + Liquidity Sweep Scalper v7.0       |
+//|              SMC Structure + Liquidity Sweep Scalper v8.0       |
 //|                                                                  |
-//|  v7.0: CHoCH required. H1 bias for all. FVG-only. Quality.     |
+//|  v8.0: EMERGENCY FIX. Tighter risk for small accounts.          |
+//|        Fractal CHoCH. Tighter trails.                           |
 //+------------------------------------------------------------------+
 #property copyright "SMC_ScalperEA"
-#property version   "7.0"
+#property version   "8.0"
 #property description "SMC Scalper | CHoCH + HTF Bias + FVG Entry | 1:3 RR Min"
 #property strict
 
