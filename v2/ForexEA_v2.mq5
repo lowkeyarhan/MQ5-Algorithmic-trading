@@ -1,18 +1,17 @@
 //+------------------------------------------------------------------+
-//|                                               ForexEA_v2.mq5    |
-//|           Institutional EA v2 — 24/7 Hedge Fund Robot           |
+//|                                               ForexEA_v2.mq5     |
+//|           Institutional EA v2.2 — Sniper Execution               |
 //|                                                                  |
 //|  Strategy:    Multi-confluence quant system                      |
-//|  Entry TF:    M5 (tick-based fast entry)                        |
-//|  Confirm TF:  M15 (CHoCH validation)                            |
-//|  Bias TF:     H4 + H1 + M15 (3-vote fractal swing structure)    |
-//|  Pairs:       EURUSD GBPUSD USDJPY USDCHF XAUUSD BTCUSD         |
-//|  Risk:        1.5% / trade | 10% hard daily cap                 |
-//|  Account:     $20+ micro-accounts, fully auto-scaling           |
+//|  Entry TF:    M5 (tick-based fast entry)                         |
+//|  Bias TF:     H1 + M15 (2-vote fractal swing structure)          |
+//|  Pairs:       EURUSD GBPUSD USDJPY USDCHF XAUUSD BTCUSD          |
+//|  Risk:        2.5% / trade | 10% hard daily cap                  |
+//|  Account:     Optimized for $20+ micro-accounts                  |
 //+------------------------------------------------------------------+
 #property copyright "InstEA_v2"
-#property version   "2.00"
-#property description "Institutional EA v2 | SMC + OrderFlow + LiqMap + QuantFilter | Min $20"
+#property version   "2.20"
+#property description "Institutional EA v2.2 | Sniper Execution | Hard TP Cap | Optimized for Micro Accounts"
 #property strict
 
 #include "Include/Defines.mqh"
@@ -35,28 +34,28 @@ input bool     InpTradeGBPUSD  = true;
 input bool     InpTradeUSDJPY  = true;
 input bool     InpTradeUSDCHF  = true;
 input bool     InpTradeXAUUSD  = true;
-input bool     InpTradeBTCUSD  = false;     // disabled by default — high spread
+input bool     InpTradeBTCUSD  = false;
 
 input string   InpSep2         = "─── Timeframes ───";
 input ENUM_TIMEFRAMES InpTF    = PERIOD_M1;    // Entry TF: M1 for scalping
 input ENUM_TIMEFRAMES InpHTF   = PERIOD_M5;    // Confirmation TF: M5
 
 input string   InpSep3         = "─── Risk ───";
-input double   InpRiskPct       = 3.0;        // % risk per trade (1:500 leverage)
-input double   InpMaxDailyLoss  = 10.0;       // Hard daily loss cap % (never change)
-input double   InpMaxDailyProfit= 20.0;       // Daily profit target %
-input int      InpMaxTrades     = 20;         // Max trades per day (scalping)
-input bool     InpIgnoreDailyTarget = true;   // For backtesting
+input double   InpRiskPct       = 2.5;     // % risk per trade (4 losses = max daily)
+input double   InpMaxDailyLoss  = 10.0;    // Hard daily loss cap % (10% max safe limit)
+input double   InpMaxDailyProfit= 15.0;    // Daily profit target % (15% target)
+input int      InpMaxTrades     = 10;      // Max trades per day
+input bool     InpIgnoreDailyTarget = true;// For backtesting
 
 input string   InpSep4         = "─── Trade Mgmt ───";
 input bool     InpUseBreakeven = true;
 input bool     InpUsePartial   = true;
 input bool     InpUseTrail     = true;
-input int      InpSlippage     = 10;        // points
-input int      InpLimitTimeout = 20;        // minutes before cancelling limit orders
+input int      InpSlippage     = 10;
+input int      InpLimitTimeout = 20;
 
 input string   InpSep5         = "─── Filters ───";
-input int      InpMinScore     = 35;        // min confluence score (0-100)
+input int      InpMinScore     = 30;       // Lowered slightly to allow for direct momentum triggers
 
 input string   InpSep6         = "─── Display ───";
 input bool     InpShowDashboard = true;
@@ -76,8 +75,8 @@ struct SPairState {
    datetime          lastBar;
    datetime          lastSessTradeTime;
    ENUM_SESSION      lastSession;
-   int               sessionTradeCount;  // trades per session (max 1 per pair)
-   bool              setupArmed;         // true = setup confirmed, watching price
+   int               sessionTradeCount;
+   bool              setupArmed;
    double            armedLot;
 };
 
@@ -87,8 +86,6 @@ CRiskManager *g_risk;
 CTradeManager*g_trade;
 CDashboard   *g_dash;
 datetime      g_lastReset;
-
-// For dashboard state
 ENUM_SIGNAL_DIR g_lastDir    = DIR_NONE;
 string          g_lastReason = "Waiting...";
 int             g_lastScore  = 0;
@@ -119,7 +116,7 @@ string ResolveSymbol(string base) {
 int OnInit() {
    Print("═══════════════════════════════════════════");
    Print(EA_NAME_V2, " v", EA_VERSION_V2, " STARTING");
-   Print("Strategy: SMC+OrderFlow+LiqMap+QuantFilter");
+   Print("Strategy: SMC+OrderFlow+LiqMap+QuantFilter Sniper");
    Print("Risk: ", DoubleToString(InpRiskPct,1), "% | DailyLoss: ",
          DoubleToString(InpMaxDailyLoss,0), "% | MinScore: ", InpMinScore);
    Print("═══════════════════════════════════════════");
@@ -136,13 +133,11 @@ int OnInit() {
 
    g_pairCount = 0;
    ArrayResize(g_pairs, 6);
-
    for(int i = 0; i < 6; i++) {
       if(!enab[i]) continue;
       string sym = ResolveSymbol(bases[i]);
       if(sym == "") { Print("WARNING: ", bases[i], " unavailable"); continue; }
       SymbolSelect(sym, true);
-
       g_pairs[g_pairCount].symbol             = sym;
       g_pairs[g_pairCount].active             = true;
       g_pairs[g_pairCount].engine             = new CSMCEngine(sym, InpTF, InpHTF);
@@ -202,7 +197,6 @@ void CheckDailyReset() {
    datetime today = StructToTime(dt);
    if(g_lastReset == today) return;
    g_lastReset = today;
-
    for(int i = 0; i < g_pairCount; i++) {
       g_pairs[i].engine.ResetDay();
       g_pairs[i].sessionTradeCount = 0;
@@ -242,7 +236,6 @@ bool IsCorrelated(string symbol, ENUM_SIGNAL_DIR dir) {
       openDirs[cnt] = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? DIR_BUY : DIR_SELL;
       cnt++;
    }
-   // Use any quant instance (first active pair) — method is not static
    for(int i = 0; i < g_pairCount; i++) {
       if(g_pairs[i].quant != NULL)
          return g_pairs[i].quant.IsCorrelationBlocked(symbol, dir, openSyms, openDirs, cnt);
@@ -252,7 +245,6 @@ bool IsCorrelated(string symbol, ENUM_SIGNAL_DIR dir) {
 
 //============================================================
 //  PROCESS SINGLE PAIR ON EACH TICK
-//  (armed setup entry check — fires without waiting for bar)
 //============================================================
 
 bool TryTickEntry(int idx) {
@@ -261,7 +253,6 @@ bool TryTickEntry(int idx) {
    if(setup.phase != PHASE_CONFIRMED) { g_pairs[idx].setupArmed = false; return false; }
    if(setup.entryFired) return false;
 
-   // Validity check: setup age
    int ageBars = (int)((TimeCurrent() - setup.setupTime) / PeriodSeconds(InpTF));
    if(ageBars > SETUP_MAX_AGE_BARS) {
       Print("[", g_pairs[idx].symbol, "] Setup expired (", ageBars, " bars)");
@@ -270,7 +261,6 @@ bool TryTickEntry(int idx) {
       return false;
    }
 
-   // Use pre-calculated lot
    if(g_pairs[idx].armedLot <= 0) return false;
    double lot = g_pairs[idx].armedLot;
 
@@ -282,7 +272,6 @@ bool TryTickEntry(int idx) {
       setup.takeProfit,
       lot
    );
-
    if(placed) {
       g_pairs[idx].engine.OnTradePlaced();
       g_pairs[idx].setupArmed = false;
@@ -291,7 +280,6 @@ bool TryTickEntry(int idx) {
       g_lastDir    = setup.direction;
       g_lastReason = setup.reason;
 
-      // Draw FVG on chart
       if(g_pairs[idx].symbol == _Symbol && InpShowDashboard)
          g_dash.DrawFVG(g_pairs[idx].symbol, setup.fvg.upper, setup.fvg.lower,
                         setup.fvg.isBullish, setup.fvg.time);
@@ -308,14 +296,10 @@ void ProcessPairNewBar(int idx) {
    string sym     = g_pairs[idx].symbol;
    ENUM_SESSION ses = CMarketRegime::GetSession();
 
-   // Max 3 scalp trades per pair per session
    if(g_pairs[idx].sessionTradeCount >= 3) return;
-
-   // Existing position or pending → skip
    if(g_trade.CountPositions(sym) > 0) return;
    if(g_trade.CountPending(sym) > 0)   return;
-
-   // Risk check
+   
    string riskReason;
    if(!g_risk.CanTrade(riskReason)) {
       if(g_pairs[idx].engine.HasSetup()) g_pairs[idx].engine.InvalidateSetup();
@@ -323,67 +307,52 @@ void ProcessPairNewBar(int idx) {
       return;
    }
 
-   // ── REGIME UPDATE ─────────────────────────────────────
    g_pairs[idx].regime.Update();
    SMarketRegime mr = g_pairs[idx].regime.GetRegime();
-
-   // Skip choppy markets entirely
    if(mr.regime == REGIME_CHOPPY) return;
 
-   // ── LIQUIDITY MAP ─────────────────────────────────────
    g_pairs[idx].liqmap.Update(InpHTF);
-
-   // ── SMC ENGINE ────────────────────────────────────────
    bool setupReady = g_pairs[idx].engine.Update(ses);
    if(!setupReady) return;
 
    SConfluenceSetup setup = g_pairs[idx].engine.GetSetup();
-
-   // ── ORDER FLOW SCAN ───────────────────────────────────
    SOrderFlowData of = g_pairs[idx].orderflow.Scan(
       InpTF,
       setup.sweepWickTip,
-      (setup.direction == DIR_SELL),   // true if sweep was at a high (sell setup)
+      (setup.direction == DIR_SELL),   
       setup.direction
    );
-
-   // ── LIQUIDITY PROXIMITY BONUS ─────────────────────────
+   
    int liqBonus = g_pairs[idx].liqmap.ProximityBonus(setup.entryPrice, setup.direction, 10.0);
    bool inDiscount = g_pairs[idx].liqmap.IsInDiscount(PERIOD_H1, 60);
-
-   // ── CONFLUENCE SCORE ──────────────────────────────────
+   
    int score = g_pairs[idx].quant.ScoreConfluence(setup, mr, of, liqBonus, inDiscount);
    g_pairs[idx].engine.SetScore(score);
-
+   
    if(score < InpMinScore) {
       Print("[", sym, "] Score too low: ", score, "/100 (min ", InpMinScore, ")");
       return;
    }
 
-   // ── CORRELATION CHECK ─────────────────────────────────
    if(IsCorrelated(sym, setup.direction)) {
       Print("[", sym, "] Correlation blocked");
       return;
    }
 
-   // ── LOT SIZING ────────────────────────────────────────
    double lot = g_risk.CalculateLot(sym, setup.entryPrice, setup.stopLoss);
    if(lot <= 0) { g_pairs[idx].engine.InvalidateSetup(); return; }
 
-   // ── ARM SETUP FOR TICK ENTRY ──────────────────────────
    g_pairs[idx].setupArmed = true;
    g_pairs[idx].armedLot   = lot;
    g_lastScore  = score;
    g_lastBias   = mr.bias;
    g_lastRegime = mr.regime;
-
    Print("[", sym, "] SETUP ARMED | Score=", score, " Bias=", EnumToString(mr.bias),
          " Dir=", (setup.direction == DIR_BUY ? "BUY" : "SELL"),
          " E=", DoubleToString(setup.entryPrice, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
          " SL=", DoubleToString(setup.slPips, 1), "p RR=1:",
          DoubleToString(setup.riskReward, 1), " Lot=", DoubleToString(lot, 2));
-
-   // Draw Asia levels on primary chart
+         
    if(sym == _Symbol && InpShowDashboard) {
       SAsiaLevels asia = g_pairs[idx].engine.GetAsiaLevels();
       if(asia.valid) g_dash.DrawAsiaLevels(sym, asia.high, asia.low);
@@ -396,41 +365,29 @@ void ProcessPairNewBar(int idx) {
 
 void OnTick() {
    CheckDailyReset();
-
-   // ── Emergency: check daily loss cap every tick ──────
    bool capBreached = g_risk.Update();
    if(capBreached) {
       g_trade.CloseAll();
       return;
    }
 
-   // ── Manage open positions every tick ────────────────
    g_trade.ManagePositions();
-
-   // ── Try tick entry for any armed setup ──────────────
+   
    for(int i = 0; i < g_pairCount; i++) {
       if(!g_pairs[i].active) continue;
       if(g_pairs[i].setupArmed) TryTickEntry(i);
    }
 
-   // ── New bar check per pair ───────────────────────────
    for(int i = 0; i < g_pairCount; i++) {
       if(!g_pairs[i].active) continue;
       datetime barT = iTime(g_pairs[i].symbol, InpTF, 0);
       if(barT == 0 || barT == g_pairs[i].lastBar) continue;
       g_pairs[i].lastBar = barT;
-
-      // Cancel stale limits for this pair
       g_trade.CancelStaleLimits(InpLimitTimeout);
-
-      // Session tracking
       CheckSessionReset(i);
-
-      // Process new bar analysis
       ProcessPairNewBar(i);
    }
 
-   // ── Dashboard update ────────────────────────────────
    if(InpShowDashboard) {
       string session = CMarketRegime::SessionName(CMarketRegime::GetSession());
       g_dash.Update(
@@ -448,7 +405,7 @@ void OnTick() {
 }
 
 //============================================================
-//  TRADE CLOSE EVENT — update realized P&L
+//  TRADE CLOSE EVENT
 //============================================================
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -460,7 +417,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) return;
-
    double profit  = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
    double swap    = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
    double comm    = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
@@ -468,7 +424,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    double netPnL  = profit + swap + comm;
 
    g_risk.OnTradeClose(netPnL);
-
    for(int i = 0; i < g_pairCount; i++) {
       if(g_pairs[i].symbol == symbol) {
          g_pairs[i].engine.OnTradeClose();
@@ -482,12 +437,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //============================================================
-//  TIMER — heartbeat every 60s
+//  TIMER
 //============================================================
 
 void OnTimer() {
-   // GMT midnight daily reset backup
-   MqlDateTime dt; TimeToStruct(TimeGMT(), dt);
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
    if(dt.hour == 0 && dt.min < 2) {
       for(int i = 0; i < g_pairCount; i++) {
          g_pairs[i].engine.ResetDay();

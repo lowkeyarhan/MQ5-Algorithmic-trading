@@ -1,7 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                    Defines.mqh   |
-//|           Institutional EA v2 — Core Definitions                 |
-//|  All enums, structs and constants shared across modules          |
+//|           Institutional EA v2.2 — Core Definitions               |
 //+------------------------------------------------------------------+
 #ifndef DEFINES_V2_MQH
 #define DEFINES_V2_MQH
@@ -66,9 +65,9 @@ enum ENUM_SETUP_PHASE {
 
 enum ENUM_TRAIL_PHASE {
    TRAIL_NONE    = 0,
-   TRAIL_PHASE1  = 1,   // 1.0R–1.5R: 1.2×ATR
-   TRAIL_PHASE2  = 2,   // 1.5R–3.0R: 0.8×ATR
-   TRAIL_PHASE3  = 3    // >3.0R:     0.5×ATR
+   TRAIL_PHASE1  = 1,   
+   TRAIL_PHASE2  = 2,   
+   TRAIL_PHASE3  = 3    
 };
 
 //============================================================
@@ -104,12 +103,12 @@ struct SFVG {
    bool          active;
    ENUM_FVG_GRADE grade;
    int           touchCount;
-   double        displacementBody;  // body size of displacement candle (quality signal)
+   double        displacementBody; 
 };
 
 struct SLiquidityPool {
    double   price;
-   bool     isBuyStop;    // true = buy-stop cluster above (equal highs)
+   bool     isBuyStop;
    int      touchCount;
    int      ageInBars;
    double   score;        // 0–100
@@ -118,19 +117,19 @@ struct SLiquidityPool {
 };
 
 struct SOrderFlowData {
-   double   cumulativeDelta;    // approximate buy-sell pressure
+   double   cumulativeDelta;
    bool     absorptionDetected;
    bool     imbalanceDetected;
    bool     stopHuntBarDetected;
    bool     volumeDivergence;
-   double   dominantDelta;      // last N bars net delta
+   double   dominantDelta;
 };
 
 struct SMarketRegime {
    ENUM_REGIME      regime;
    ENUM_VOLATILITY  volatility;
-   ENUM_HTF_BIAS    bias;       // 3-TF consensus bias
-   bool             biasStrong; // all 3 TFs agree
+   ENUM_HTF_BIAS    bias;       
+   bool             biasStrong;
 };
 
 struct SConfluenceSetup {
@@ -146,7 +145,7 @@ struct SConfluenceSetup {
    double            sweepWickTip;
    datetime          setupTime;
    datetime          lastArmTime;
-   int               confluenceScore;  // 0–100
+   int               confluenceScore;
    string            reason;
    bool              entryFired;
 };
@@ -172,7 +171,7 @@ struct STradeRecord {
    double   stopLoss;
    double   takeProfit;
    double   lotSize;
-   double   initialRisk;     // in price distance
+   double   initialRisk;
    datetime openTime;
    bool     breakevenSet;
    bool     partial1Done;
@@ -184,7 +183,7 @@ struct STradeRecord {
 //  IDENTITY
 //============================================================
 #define EA_NAME_V2         "InstEA_v2"
-#define EA_VERSION_V2      "2.0.0"
+#define EA_VERSION_V2      "2.2.0"
 #define MAGIC_NUMBER_V2    20260306L
 
 //============================================================
@@ -239,7 +238,7 @@ struct STradeRecord {
 #define MAX_SL_PIPS_GOLD    90.0
 #define MIN_SL_PIPS_BTC     30.0
 #define MAX_SL_PIPS_BTC    600.0
-#define SL_BUFFER_FX         1.0    // extra pips beyond sweep wick
+#define SL_BUFFER_FX         1.0    
 #define SL_BUFFER_GOLD       2.0
 #define SL_BUFFER_BTC       20.0
 
@@ -262,44 +261,44 @@ struct STradeRecord {
 //============================================================
 //  DISPLACEMENT
 //============================================================
-#define DISP_ATR_MULT        0.30   // min body size for displacement candle (M1 scalping)
+#define DISP_ATR_MULT        0.30   
 
 //============================================================
 //  TRADE MANAGEMENT R-LEVELS
 //============================================================
-#define BE_R_TRIGGER         0.5    // move SL to BE at 0.5R (scalping: protect fast)
-#define PARTIAL1_R           1.0    // close 30% at 1R (lock profit on scalp)
-#define PARTIAL2_R           2.0    // close 30% at 2R (let rest run)
-#define PARTIAL1_PCT         0.30
-#define PARTIAL2_PCT         0.30
-#define TARGET_RR            2.0    // minimum RR to take trade (scalping = 2R minimum)
+#define BE_R_TRIGGER         1.0    // Move SL to BE at 1.0R to protect capital
+#define PARTIAL1_R           2.0    // First partial at 2R
+#define PARTIAL2_R           3.0    // Second partial at 3R
+#define PARTIAL1_PCT         0.20   // Secure margin
+#define PARTIAL2_PCT         0.30   // Secure margin
+#define TARGET_RR            4.0    // HARD CAP: Instant close at exactly 1:4 RR
 
 // Trailing SL phases (ATR multiplier behind price)
-#define TRAIL_P1_START_R     0.5    // start tightening trail early on M1
-#define TRAIL_P1_ATR_MULT    0.8    // tighter — M1 ATR is small
-#define TRAIL_P2_START_R     1.0
-#define TRAIL_P2_ATR_MULT    0.5
-#define TRAIL_P3_START_R     2.0
-#define TRAIL_P3_ATR_MULT    0.3    // very tight at 2R+ on scalp
+#define TRAIL_P1_START_R     1.5    // Don't trail until 1.5R
+#define TRAIL_P1_ATR_MULT    1.5    // Very loose trail initially
+#define TRAIL_P2_START_R     2.5
+#define TRAIL_P2_ATR_MULT    1.0
+#define TRAIL_P3_START_R     3.5
+#define TRAIL_P3_ATR_MULT    0.5    // Choke it only when deep in profit
 
 //============================================================
 //  RISK CONTROL
 //============================================================
-#define LOSSES_REDUCE_AT     2     // after 2 losses → 50% size
-#define MARGIN_FLOOR        150.0  // % margin level floor
-#define MAX_LOT_RISK_PCT     6.0   // 1:500 leverage — min lot acceptable up to 6% ($20 account)
+#define LOSSES_REDUCE_AT     2     
+#define MARGIN_FLOOR        150.0  
+#define MAX_LOT_RISK_PCT    10.0   // Raised to 10% to prevent micro-account rejection on 0.01 lots
 
 //============================================================
 //  CONFLUENCE SCORING THRESHOLDS
 //============================================================
-#define MIN_CONFLUENCE_SCORE 35    // out of 100 (SMC base is already 20)
+#define MIN_CONFLUENCE_SCORE 30    // Lowered slightly to accommodate immediate momentum entries
 
 //============================================================
 //  EXECUTION
 //============================================================
-#define ENTRY_TOLERANCE_PTS   5   // fire market order if within 5 broker points
-#define SETUP_MAX_AGE_BARS   25   // M1: 25 bars = ~25 min before setup expires
-#define MIN_BARS_BETWEEN     3    // min M1 bars between trades on same pair (~3 min)
+#define ENTRY_TOLERANCE_PTS   5   
+#define SETUP_MAX_AGE_BARS   25   
+#define MIN_BARS_BETWEEN     3    
 
 //============================================================
 //  STREAK CONTROL

@@ -1,8 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              MarketRegime.mqh    |
-//|         Institutional EA v2 — Market Regime & Bias Engine        |
-//|  Pure fractal swing structure on H4+H1+M15 (no EMA noise)       |
-//|  Regime: trending/ranging/choppy based on ATR ratio              |
+//|         Institutional EA v2.2 — Market Regime & Bias Engine      |
 //+------------------------------------------------------------------+
 #ifndef MARKETREGIME_V2_MQH
 #define MARKETREGIME_V2_MQH
@@ -30,17 +28,16 @@ private:
       int c = CopyBuffer(h, 0, 0, period + 2, buf);
       IndicatorRelease(h);
       if(c < 2) return 0;
-      return buf[1]; // confirmed closed bar
+      return buf[1];
    }
 
    //-----------------------------------------------------------
    // FRACTAL SWING BIAS on a single timeframe
-   // Returns bullish/bearish/none based on last 2 swing H/L
    //-----------------------------------------------------------
    ENUM_HTF_BIAS GetSwingBias(ENUM_TIMEFRAMES tf) {
-      int lb    = (tf == PERIOD_H4) ? 3 : 2;
+      int lb    = 2;
       int total = iBars(m_symbol, tf);
-      int scan  = MathMin(total - lb - 1, (tf == PERIOD_H4) ? 80 : 50);
+      int scan  = MathMin(total - lb - 1, 50);
       if(scan < lb + 3) return BIAS_NONE;
 
       double sh[3], sl[3];
@@ -48,7 +45,6 @@ private:
       ArrayInitialize(sh, 0); ArrayInitialize(sl, 0);
 
       for(int i = lb; i < scan && (shC < 3 || slC < 3); i++) {
-         // Swing High
          if(shC < 3) {
             double hi = iHigh(m_symbol, tf, i);
             bool ok = true;
@@ -57,7 +53,6 @@ private:
                   ok = false;
             if(ok) sh[shC++] = hi;
          }
-         // Swing Low
          if(slC < 3) {
             double lo = iLow(m_symbol, tf, i);
             bool ok = true;
@@ -107,7 +102,6 @@ private:
 
    //-----------------------------------------------------------
    // CHOPPY DETECTION
-   // High wick-to-body ratio over last N bars = choppy price action
    //-----------------------------------------------------------
    bool IsChoppy(ENUM_TIMEFRAMES tf, int bars = 8) {
       int total = iBars(m_symbol, tf);
@@ -125,27 +119,23 @@ private:
          wickBodyRatioSum += (wick / range);
       }
       double avgRatio = wickBodyRatioSum / bars;
-      return (avgRatio > 0.72); // >72% wick = choppy
+      return (avgRatio > 0.72);
    }
 
    //-----------------------------------------------------------
-   // TREND REGIME via price vs recent range
+   // TREND REGIME 
    //-----------------------------------------------------------
    ENUM_REGIME DetermineRegime() {
-      // Choppy overrides everything
       if(IsChoppy(PERIOD_M15, 10)) return REGIME_CHOPPY;
-
       ENUM_VOLATILITY vol = GetVolatility();
       if(vol == VOL_LOW) return REGIME_RANGING;
 
       ENUM_HTF_BIAS b1 = GetSwingBias(PERIOD_H1);
-      ENUM_HTF_BIAS b4 = GetSwingBias(PERIOD_H4);
-
-      if(b4 == BIAS_BULLISH && b1 == BIAS_BULLISH) return REGIME_TRENDING_UP;
-      if(b4 == BIAS_BEARISH && b1 == BIAS_BEARISH) return REGIME_TRENDING_DOWN;
-      if(b4 == BIAS_NONE    && b1 == BIAS_NONE)    return REGIME_RANGING;
-
-      // Mixed: still tradable but treat as ranging
+      ENUM_HTF_BIAS b15 = GetSwingBias(PERIOD_M15);
+      
+      if(b1 == BIAS_BULLISH && b15 == BIAS_BULLISH) return REGIME_TRENDING_UP;
+      if(b1 == BIAS_BEARISH && b15 == BIAS_BEARISH) return REGIME_TRENDING_DOWN;
+      if(b1 == BIAS_NONE    && b15 == BIAS_NONE)    return REGIME_RANGING;
       return REGIME_RANGING;
    }
 
@@ -155,12 +145,10 @@ public:
       m_isGold   = (StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0);
       m_isJPY    = (StringFind(symbol, "JPY") >= 0);
       m_isBTC    = (StringFind(symbol, "BTC") >= 0);
-
       if(m_isGold)      m_pipSize = 0.10;
       else if(m_isJPY)  m_pipSize = 0.01;
       else if(m_isBTC)  m_pipSize = 1.0;
       else              m_pipSize = 0.0001;
-
       ZeroMemory(m_cached);
       m_cached.regime    = REGIME_RANGING;
       m_cached.bias      = BIAS_NONE;
@@ -176,37 +164,35 @@ public:
       if(barT == m_lastUpdate) return;
       m_lastUpdate = barT;
 
-      // 3-TF bias consensus
-      ENUM_HTF_BIAS bH4 = GetSwingBias(PERIOD_H4);
       ENUM_HTF_BIAS bH1 = GetSwingBias(PERIOD_H1);
       ENUM_HTF_BIAS bM15= GetSwingBias(PERIOD_M15);
 
-      int bullVotes = (bH4 == BIAS_BULLISH ? 1 : 0) +
-                      (bH1 == BIAS_BULLISH ? 1 : 0) +
-                      (bM15== BIAS_BULLISH ? 1 : 0);
-      int bearVotes = (bH4 == BIAS_BEARISH ? 1 : 0) +
-                      (bH1 == BIAS_BEARISH ? 1 : 0) +
-                      (bM15== BIAS_BEARISH ? 1 : 0);
-
-      if(bullVotes == 3)      { m_cached.bias = BIAS_BULLISH; m_cached.biasStrong = true;  }
-      else if(bearVotes == 3) { m_cached.bias = BIAS_BEARISH; m_cached.biasStrong = true;  }
-      else if(bullVotes == 2) { m_cached.bias = BIAS_BULLISH; m_cached.biasStrong = false; }
-      else if(bearVotes == 2) { m_cached.bias = BIAS_BEARISH; m_cached.biasStrong = false; }
-      else                    { m_cached.bias = BIAS_CONFLICT;m_cached.biasStrong = false; }
+      if(bH1 == BIAS_BULLISH && bM15 == BIAS_BULLISH) { 
+         m_cached.bias = BIAS_BULLISH; m_cached.biasStrong = true;
+      }
+      else if(bH1 == BIAS_BEARISH && bM15 == BIAS_BEARISH) { 
+         m_cached.bias = BIAS_BEARISH; m_cached.biasStrong = true;
+      }
+      else if(bH1 == BIAS_BULLISH || bM15 == BIAS_BULLISH) { 
+         m_cached.bias = BIAS_BULLISH; m_cached.biasStrong = false;
+      }
+      else if(bH1 == BIAS_BEARISH || bM15 == BIAS_BEARISH) { 
+         m_cached.bias = BIAS_BEARISH; m_cached.biasStrong = false;
+      }
+      else { 
+         m_cached.bias = BIAS_CONFLICT; m_cached.biasStrong = false;
+      }
 
       m_cached.volatility = GetVolatility();
       m_cached.regime     = DetermineRegime();
    }
 
    SMarketRegime  GetRegime()      { return m_cached; }
-   ENUM_HTF_BIAS  GetBias()        { return m_cached.bias;        }
-   bool           IsBiasStrong()   { return m_cached.biasStrong;  }
-   ENUM_VOLATILITY GetVolTier()    { return m_cached.volatility;  }
+   ENUM_HTF_BIAS  GetBias()        { return m_cached.bias; }
+   bool           IsBiasStrong()   { return m_cached.biasStrong; }
+   ENUM_VOLATILITY GetVolTier()    { return m_cached.volatility; }
    bool           IsChoppyNow()    { return (m_cached.regime == REGIME_CHOPPY); }
 
-   //-----------------------------------------------------------
-   // SESSION DETECTION (GMT)
-   //-----------------------------------------------------------
    static ENUM_SESSION GetSession() {
       MqlDateTime dt;
       TimeToStruct(TimeGMT(), dt);

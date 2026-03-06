@@ -1,8 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              TradeManager.mqh   |
-//|      Institutional EA v2 — Fast Execution + Position Mgmt      |
-//|  Tick-based entry (market order fires instantly on touch).      |
-//|  3-phase adaptive ATR trailing SL. Partial exits. Float watch. |
+//|      Institutional EA v2.2 — Fast Execution + Position Mgmt      |
 //+------------------------------------------------------------------+
 #ifndef TRADEMANAGER_V2_MQH
 #define TRADEMANAGER_V2_MQH
@@ -24,7 +22,6 @@ private:
    bool   m_useTrail;
    ulong  m_magic;
 
-   //--- Pending limit orders tracking
    struct SPendingOrder {
       string   symbol;
       ulong    ticket;
@@ -35,14 +32,12 @@ private:
    SPendingOrder m_pending[];
    int           m_pendingCount;
 
-   //--- Per-position management state (INDEX-BASED — no struct pointers)
    ulong          m_mgmtTicket[];
    bool           m_mgmtP1Done[];
    bool           m_mgmtP2Done[];
-   int            m_mgmtTrailPhase[];  // 0=NONE,1=P1,2=P2,3=P3
+   int            m_mgmtTrailPhase[];
    int            m_mgmtCount;
 
-   //-----------------------------------------------------------
    ENUM_ORDER_TYPE_FILLING GetFilling(string sym) {
       long mode = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
       if((mode & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
@@ -78,14 +73,12 @@ private:
       m_pendingCount++;
    }
 
-   //--- Return index of mgmt slot for ticket, or -1 if not found
    int FindMgmtIdx(ulong ticket) {
       for(int i = 0; i < m_mgmtCount; i++)
          if(m_mgmtTicket[i] == ticket) return i;
       return -1;
    }
 
-   //--- Ensure mgmt slot exists; return index
    int EnsureMgmtIdx(ulong ticket) {
       int idx = FindMgmtIdx(ticket);
       if(idx >= 0) return idx;
@@ -99,7 +92,7 @@ private:
       m_mgmtTicket[m_mgmtCount]     = ticket;
       m_mgmtP1Done[m_mgmtCount]     = false;
       m_mgmtP2Done[m_mgmtCount]     = false;
-      m_mgmtTrailPhase[m_mgmtCount] = 0; // TRAIL_NONE
+      m_mgmtTrailPhase[m_mgmtCount] = 0; 
       return m_mgmtCount++;
    }
 
@@ -136,9 +129,6 @@ public:
       ArrayResize(m_mgmtTrailPhase, 30);
    }
 
-   //-----------------------------------------------------------
-   // FAST MARKET ORDER (preferred)
-   //-----------------------------------------------------------
    bool PlaceMarketBuy(string sym, double sl, double tp, double lot) {
       SetupForSymbol(sym);
       bool ok = m_trade.Buy(lot, sym, 0, sl, tp, "INST_BUY");
@@ -169,9 +159,6 @@ public:
       return ok;
    }
 
-   //-----------------------------------------------------------
-   // LIMIT ORDERS
-   //-----------------------------------------------------------
    bool PlaceBuyLimit(string sym, double entry, double sl, double tp, double lot) {
       SetupForSymbol(sym);
       int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
@@ -183,7 +170,6 @@ public:
       double pt  = SymbolInfoDouble(sym, SYMBOL_POINT);
       if(ask <= entry + pt * ENTRY_TOLERANCE_PTS)
          return PlaceMarketBuy(sym, sl, tp, lot);
-
       bool ok = m_trade.BuyLimit(lot, entry, sym, sl, tp, ORDER_TIME_GTC, 0, "INST_BUY_LIM");
       if(!ok) {
          uint rc = m_trade.ResultRetcode();
@@ -207,7 +193,6 @@ public:
       double pt  = SymbolInfoDouble(sym, SYMBOL_POINT);
       if(bid >= entry - pt * ENTRY_TOLERANCE_PTS)
          return PlaceMarketSell(sym, sl, tp, lot);
-
       bool ok = m_trade.SellLimit(lot, entry, sym, sl, tp, ORDER_TIME_GTC, 0, "INST_SELL_LIM");
       if(!ok) {
          uint rc = m_trade.ResultRetcode();
@@ -220,15 +205,11 @@ public:
       return true;
    }
 
-   //-----------------------------------------------------------
-   // FAST TICK-BASED ENTRY CHECK
-   //-----------------------------------------------------------
    bool CheckTickEntry(string sym, ENUM_SIGNAL_DIR dir, double entryPrice,
                        double sl, double tp, double lot) {
       int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       double pt     = SymbolInfoDouble(sym, SYMBOL_POINT);
       double tol    = pt * ENTRY_TOLERANCE_PTS;
-
       if(dir == DIR_BUY) {
          double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
          if(ask <= entryPrice + tol && ask >= entryPrice - tol * 4)
@@ -243,9 +224,6 @@ public:
       return false;
    }
 
-   //-----------------------------------------------------------
-   // MANAGE OPEN POSITIONS — call every tick
-   //-----------------------------------------------------------
    void ManagePositions() {
       int total = PositionsTotal();
       for(int i = total - 1; i >= 0; i--) {
@@ -264,7 +242,6 @@ public:
          double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
          double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
          double curP  = isBuy ? bid : ask;
-
          double slDist = MathAbs(openP - sl);
          if(slDist <= 0) continue;
 
@@ -272,11 +249,16 @@ public:
          double rMult  = profit / slDist;
 
          SetupForSymbol(sym);
-
-         // Get or create management slot
          int mi = EnsureMgmtIdx(ticket);
 
-         //── BREAKEVEN at 1.0R ──────────────────────────────
+         //── HARD CAP FAILSAFE (Instant Sell) ──────────────────
+         if(rMult >= TARGET_RR) {
+            Print("[Trade] 🎯 HARD TP REACHED (", DoubleToString(rMult, 2), "R): ", sym, ". Securing bag instantly.");
+            m_trade.PositionClose(ticket);
+            continue; 
+         }
+
+         //── BREAKEVEN ──────────────────────────────
          if(m_useBreakeven && rMult >= BE_R_TRIGGER) {
             double beBuffer = pt * 5;
             double newSL = isBuy ? NormalizeDouble(openP + beBuffer, digits)
@@ -289,7 +271,7 @@ public:
             }
          }
 
-         //── PARTIAL 1 at 2R — close 30% ────────────────────
+         //── PARTIAL 1 ────────────────────
          if(m_usePartial && rMult >= PARTIAL1_R && !m_mgmtP1Done[mi]) {
             double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
             double lotStep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
@@ -299,13 +281,13 @@ public:
             if(closeLots < lots) {
                if(m_trade.PositionClosePartial(ticket, closeLots)) {
                   m_mgmtP1Done[mi] = true;
-                  Print("[Trade] PARTIAL1 30% @", DoubleToString(rMult,1), "R: ", sym,
+                  Print("[Trade] PARTIAL1 20% @", DoubleToString(rMult,1), "R: ", sym,
                         " closed=", DoubleToString(closeLots,2));
                }
             }
          }
 
-         //── PARTIAL 2 at 3R — close another 30% ────────────
+         //── PARTIAL 2 ────────────
          if(m_usePartial && rMult >= PARTIAL2_R && !m_mgmtP2Done[mi]) {
             double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
             double lotStep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
@@ -328,7 +310,6 @@ public:
 
             double trailDist;
             int    newPhase;
-
             if(rMult >= TRAIL_P3_START_R) {
                trailDist = atr * TRAIL_P3_ATR_MULT;
                newPhase  = 3;
@@ -375,9 +356,6 @@ public:
       }
    }
 
-   //-----------------------------------------------------------
-   // CANCEL STALE LIMIT ORDERS
-   //-----------------------------------------------------------
    void CancelStaleLimits(int timeoutMin = 20) {
       for(int i = m_pendingCount - 1; i >= 0; i--) {
          if(!m_pending[i].active) continue;
@@ -402,9 +380,6 @@ public:
       }
    }
 
-   //-----------------------------------------------------------
-   // CLOSE ALL (called on daily loss cap breach)
-   //-----------------------------------------------------------
    void CloseAll() {
       for(int i = PositionsTotal() - 1; i >= 0; i--) {
          ulong t = PositionGetTicket(i);
@@ -422,9 +397,6 @@ public:
       }
    }
 
-   //-----------------------------------------------------------
-   // COUNT HELPERS
-   //-----------------------------------------------------------
    int CountPositions(string sym = "") {
       int c = 0;
       for(int i = PositionsTotal() - 1; i >= 0; i--) {
@@ -456,5 +428,4 @@ public:
       return pnl;
    }
 };
-
 #endif // TRADEMANAGER_V2_MQH
