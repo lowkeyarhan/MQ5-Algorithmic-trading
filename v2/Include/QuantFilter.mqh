@@ -17,6 +17,37 @@ private:
    bool   m_isGold;
    bool   m_isBTC;
 
+   double EMA(ENUM_TIMEFRAMES tf, int period, int shift = 1) {
+      int h = iMA(m_symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
+      if(h == INVALID_HANDLE) return 0;
+      double buf[];
+      ArraySetAsSeries(buf, true);
+      int c = CopyBuffer(h, 0, shift, 1, buf);
+      IndicatorRelease(h);
+      return (c >= 1) ? buf[0] : 0;
+   }
+
+   bool MomentumAligned(ENUM_SIGNAL_DIR dir) {
+      // Entry-timeframe momentum: EMA20 over EMA50 + EMA20 slope.
+      double e20m5_1 = EMA(PERIOD_M5, 20, 1);
+      double e20m5_2 = EMA(PERIOD_M5, 20, 2);
+      double e50m5_1 = EMA(PERIOD_M5, 50, 1);
+      // Context-timeframe trend: EMA20 over EMA50 on M15.
+      double e20m15  = EMA(PERIOD_M15, 20, 1);
+      double e50m15  = EMA(PERIOD_M15, 50, 1);
+      if(e20m5_1 <= 0 || e20m5_2 <= 0 || e50m5_1 <= 0 || e20m15 <= 0 || e50m15 <= 0)
+         return false;
+
+      bool bullM5  = (e20m5_1 > e50m5_1) && (e20m5_1 > e20m5_2);
+      bool bearM5  = (e20m5_1 < e50m5_1) && (e20m5_1 < e20m5_2);
+      bool bullM15 = (e20m15  > e50m15);
+      bool bearM15 = (e20m15  < e50m15);
+
+      if(dir == DIR_BUY)  return (bullM5 && bullM15);
+      if(dir == DIR_SELL) return (bearM5 && bearM15);
+      return false;
+   }
+
    double GetATR(ENUM_TIMEFRAMES tf, int period = 14) {
       double buf[];
       ArraySetAsSeries(buf, true);
@@ -117,22 +148,29 @@ public:
    //-----------------------------------------------------------
    // CONFLUENCE SCORE  (0–100)
    //
-   // BASE LOGIC: SMC engine has already done strict filtering
-   // (liquidity sweep + CHoCH + graded FVG required).
-   // The score adds QUALITY BONUS on top of that base.
+   // PHILOSOPHY: Quality > Quantity. Fewer A+ setups beat
+   // many B/C setups. The hard blocks below ensure we only
+   // trade when we have a genuine institutional edge.
    //
    // Score breakdown:
-   //  +20  SMC setup confirmed (base — always awarded here)
-   //  +20  HTF Bias strong (3/3 TF agree) / +12 weak (2/3)
-   //  +15  Regime TRENDING / +8 RANGING
-   //  +15  Order Flow: stop hunt / +10 both signals / +6 one signal
-   //  +10  Premium/Discount zone aligned
-   //  +10  FVG Grade A / +5 Grade B
-   //  +8   Liquidity pool proximity
-   //  +5   RSI Divergence
-   //  -15  Z-score overextension (|Z| > 2.5)
-   //  -5   Z-score extended (|Z| > 2.0)
-   //  Min to trade: 35/100
+   //  +20  SMC setup confirmed (base — always awarded)
+   //  +20  HTF Bias strong aligned / +12 weak aligned
+   //   0   HTF Bias NONE (neutral — allowed, no bonus)
+   //  HARD BLOCK if bias is CONFLICT or OPPOSING direction
+   //  +15  Regime TRENDING (required path to 55 min)
+   //  HARD BLOCK if regime is RANGING with no aligned bias
+   //  +15  Order Flow: stop hunt bar detected
+   //  +10  Order Flow: absorption + imbalance together
+   //  +6   Order Flow: one of absorption or imbalance
+   //  +4   Volume divergence confirms reversal
+   //  +10  FVG Grade A / +5 Grade B / BLOCK Grade C
+   //  +10  Premium/Discount zone aligned with direction
+   //  +8   Liquidity pool proximity (max)
+   //  +5   RSI Divergence confirms reversal
+   //  +10  Session sweep continuation (2nd+ setup in same direction)
+   //  -10  Z-score overextension > 2.5 (entering too late)
+   //  -5   Z-score extended > 2.0
+   //  Min to trade: 55/100 — only A+ institutional setups
    //-----------------------------------------------------------
    int ScoreConfluence(
          const SConfluenceSetup &setup,
@@ -141,58 +179,99 @@ public:
          int                     liquidityProximityBonus,
          bool                    inDiscount
    ) {
-      // ── BASE: SMC setup confirmed ──────────────────────────
-      int score = 20; // SMC engine: sweep + CHoCH + graded FVG = solid base
+      // ── HARD BLOCKS — return 0 immediately if any fire ──
 
-      // ── 1. HTF Bias (max 20) ──────────────────────────────
-      if(regime.bias == BIAS_CONFLICT) {
-         score -= 10; // conflicting signals — penalise but don't block
-      } else if(regime.bias != BIAS_NONE) {
-         bool aligned = (setup.direction == DIR_BUY  && regime.bias == BIAS_BULLISH) ||
-                        (setup.direction == DIR_SELL && regime.bias == BIAS_BEARISH);
-         if(aligned)
-            score += regime.biasStrong ? 20 : 12;
-         else
-            score -= 15; // bias exists but against us — strong penalty
+      // BLOCK 1: Never trade into conflicting bias (both TFs disagree on direction)
+      if(regime.bias == BIAS_CONFLICT) return 0;
+
+      // BLOCK 2: Never trade against HTF bias — this was the #1 cause of 39% win rate.
+      // If we see a bullish sweep but H1+M15 are both bearish, institutions are selling.
+      // We do NOT fade the institutional trend. Period.
+      bool biasOpposing = (setup.direction == DIR_BUY  && regime.bias == BIAS_BEARISH) ||
+                          (setup.direction == DIR_SELL && regime.bias == BIAS_BULLISH);
+      if(biasOpposing) return 0;
+
+      // BLOCK 3: No trade in ranging + unconfirmed market.
+      // Ranging with BIAS_NONE = no directional edge at all.
+      if(regime.regime == REGIME_RANGING && regime.bias == BIAS_NONE) return 0;
+
+      // BLOCK 4: C-grade FVGs are noise — HARD BLOCK, never trade.
+      // Removing this block was the primary cause of 20% win rate.
+      if(setup.fvg.grade == FVG_C) return 0;
+
+      // BLOCK 5: Require lower-timeframe momentum alignment.
+      // This removes weak "technically aligned" setups that occur when M5 flow
+      // is still against the intended direction (common source of stop-outs).
+      if(!MomentumAligned(setup.direction)) return 0;
+
+      // ── BASE SCORE ───────────────────────────────────────
+      int score = 20; // SMC confirmed: liquidity sweep + real FVG detected
+
+      // ── 1. HTF BIAS ALIGNMENT (max +20) ─────────────────
+      // Reaching here means bias is either aligned or NONE.
+      if(regime.bias != BIAS_NONE) {
+         // bias is aligned (opposing was blocked above)
+         score += regime.biasStrong ? 20 : 12;
       }
-      // BIAS_NONE: no bonus, no penalty — SMC setup alone can still trade
+      // BIAS_NONE: no bonus — SMC alone can trade but needs strong order flow
 
-      // ── 2. Regime (max 15) ──────────────────────────────
+      // ── 2. REGIME QUALITY (max +15) ──────────────────────
+      // RANGING+aligned bias still gets a partial bonus (trend forming).
       switch(regime.regime) {
          case REGIME_TRENDING_UP:
          case REGIME_TRENDING_DOWN: score += 15; break;
-         case REGIME_RANGING:       score += 8;  break;
-         case REGIME_CHOPPY:        score -= 10; break; // penalty not block
+         case REGIME_RANGING:       score += 5;  break; // reduced — less conviction
+         case REGIME_CHOPPY:        return 0;            // hard block choppy
       }
 
-      // ── 3. Order Flow (max 15) ──────────────────────────
-      if(of.stopHuntBarDetected)                          score += 15;
-      else if(of.absorptionDetected && of.imbalanceDetected) score += 10;
-      else if(of.absorptionDetected || of.imbalanceDetected) score += 6;
-      if(of.volumeDivergence)                             score += 4;
+      // ── 3. ORDER FLOW (max +19) ────────────────────
+      // OF on M5 tick volume is unreliable — especially on Gold.
+      // Use it as a SCORING BONUS, not a hard block.
+      // Exception: when bias is NONE, OF is the ONLY edge — require it.
+      bool hasOF = (of.stopHuntBarDetected || of.absorptionDetected ||
+                    of.imbalanceDetected   || of.volumeDivergence);
+      if(regime.bias == BIAS_NONE && !hasOF) return 0; // No bias + no OF = no edge
 
-      // ── 4. Liquidity proximity (max 8) ──────────────────
-      score += MathMin(liquidityProximityBonus, 8);
+      if(of.stopHuntBarDetected)
+         score += 15;                                // strongest signal
+      else if(of.absorptionDetected && of.imbalanceDetected)
+         score += 10;
+      else if(of.absorptionDetected || of.imbalanceDetected)
+         score += 6;
 
-      // ── 5. Premium/Discount zone alignment (max 10) ─────
+      if(of.volumeDivergence) score += 4;
+
+      // ── 4. FVG GRADE (max +10) ───────────────────────────
+      switch(setup.fvg.grade) {
+         case FVG_A: score += 10; break;
+         case FVG_B: score += 5;  break;
+         default:    return 0;  // C-grade should never reach here (blocked above)
+      }
+
+      // ── 5. PREMIUM/DISCOUNT ZONE (max +10) ───────────────
       bool zoneAligned = (setup.direction == DIR_BUY  && inDiscount) ||
                          (setup.direction == DIR_SELL && !inDiscount);
       if(zoneAligned) score += 10;
 
-      // ── 6. FVG Grade (max 10) ───────────────────────────
-      switch(setup.fvg.grade) {
-         case FVG_A: score += 10; break;
-         case FVG_B: score += 5;  break;
-         case FVG_C: return 0;    // hard block — C-grade FVGs are garbage
-         default:    break;
-      }
+      // ── 6. LIQUIDITY PROXIMITY (max +8) ──────────────────
+      score += MathMin(liquidityProximityBonus, 8);
 
-      // ── 7. RSI Divergence bonus ──────────────────────────
+      // ── 7. RSI DIVERGENCE (max +5) ───────────────────────
       if(HasRSIDivergence(PERIOD_M15, setup.direction, 14)) score += 5;
 
-      // ── 8. Z-score overextension penalty ────────────────
+      // ── 8. SESSION SWEEP CONTINUATION (max +10) ──────────
+      // When the first sweep of the session has already established a direction,
+      // a subsequent setup in the SAME direction is a trend-continuation trade —
+      // the highest probability pattern in M5 SMC scalping. The first sweep tells
+      // us where institutions are positioned; we should follow on every retracement FVG.
+      bool isContinuation = (setup.sessionSweepDir != DIR_NONE &&
+                             setup.direction == setup.sessionSweepDir);
+      if(isContinuation) score += 10;
+
+      // ── 9. Z-SCORE OVEREXTENSION PENALTY ─────────────────
+      // Penalize but don't nuke — strong momentum has Z>2 naturally.
       double absZ = MathAbs(GetZScore(PERIOD_M15, 20));
-      if(absZ > 2.5) score -= 15;
+      if(absZ > 2.5) score -= 10;
       else if(absZ > 2.0) score -= 5;
 
       return MathMax(0, MathMin(score, 100));

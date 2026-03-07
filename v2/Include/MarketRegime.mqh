@@ -37,7 +37,7 @@ private:
    ENUM_HTF_BIAS GetSwingBias(ENUM_TIMEFRAMES tf) {
       int lb    = 2;
       int total = iBars(m_symbol, tf);
-      int scan  = MathMin(total - lb - 1, 50);
+      int scan  = MathMin(total - lb - 1, 100); // Extended: 100 bars covers full trading week on H1
       if(scan < lb + 3) return BIAS_NONE;
 
       double sh[3], sl[3];
@@ -130,12 +130,16 @@ private:
       ENUM_VOLATILITY vol = GetVolatility();
       if(vol == VOL_LOW) return REGIME_RANGING;
 
-      ENUM_HTF_BIAS b1 = GetSwingBias(PERIOD_H1);
-      ENUM_HTF_BIAS b15 = GetSwingBias(PERIOD_M15);
-      
-      if(b1 == BIAS_BULLISH && b15 == BIAS_BULLISH) return REGIME_TRENDING_UP;
-      if(b1 == BIAS_BEARISH && b15 == BIAS_BEARISH) return REGIME_TRENDING_DOWN;
-      if(b1 == BIAS_NONE    && b15 == BIAS_NONE)    return REGIME_RANGING;
+      // H1 dominates for regime classification. A trending H1 IS a trending market
+      // regardless of what M15 is doing (M15 corrections are normal within H1 trends).
+      ENUM_HTF_BIAS bH1  = GetSwingBias(PERIOD_H1);
+      ENUM_HTF_BIAS bM15 = GetSwingBias(PERIOD_M15);
+
+      if(bH1 == BIAS_BULLISH) return REGIME_TRENDING_UP;
+      if(bH1 == BIAS_BEARISH) return REGIME_TRENDING_DOWN;
+      // H1 is unclear — fall back to M15 for intraday session context
+      if(bM15 == BIAS_BULLISH) return REGIME_TRENDING_UP;
+      if(bM15 == BIAS_BEARISH) return REGIME_TRENDING_DOWN;
       return REGIME_RANGING;
    }
 
@@ -167,20 +171,42 @@ public:
       ENUM_HTF_BIAS bH1 = GetSwingBias(PERIOD_H1);
       ENUM_HTF_BIAS bM15= GetSwingBias(PERIOD_M15);
 
-      if(bH1 == BIAS_BULLISH && bM15 == BIAS_BULLISH) { 
-         m_cached.bias = BIAS_BULLISH; m_cached.biasStrong = true;
+      // H1 is the structural frame. It ALWAYS wins when it has a clear direction.
+      // The previous || (OR) logic caused a catastrophic bug: when H1=BEARISH and
+      // M15=BULLISH (normal correction), the OR condition set bias=BULLISH, blocking
+      // all aligned SELL setups and allowing counter-trend BUYs. This produced 39% win rate.
+      //
+      // Correct model:
+      //   H1 BULL + M15 BULL   → strong bullish  (both frames agree)
+      //   H1 BULL + M15 BEAR   → weak bullish    (H1 wins; M15 is just a retracement)
+      //   H1 BULL + M15 NONE   → weak bullish    (H1 leads, M15 undecided)
+      //   H1 BEAR + M15 BEAR   → strong bearish
+      //   H1 BEAR + M15 BULL   → weak bearish    (H1 wins; M15 pullback = entry opportunity)
+      //   H1 BEAR + M15 NONE   → weak bearish
+      //   H1 NONE + M15 BULL   → weak bullish    (M15-led session context)
+      //   H1 NONE + M15 BEAR   → weak bearish    (M15-led session context)
+      //   H1 NONE + M15 NONE   → BIAS_NONE       (market sideways both frames — high bar needed)
+      if(bH1 == BIAS_BULLISH) {
+         m_cached.bias      = BIAS_BULLISH;
+         m_cached.biasStrong = (bM15 == BIAS_BULLISH);
       }
-      else if(bH1 == BIAS_BEARISH && bM15 == BIAS_BEARISH) { 
-         m_cached.bias = BIAS_BEARISH; m_cached.biasStrong = true;
+      else if(bH1 == BIAS_BEARISH) {
+         m_cached.bias      = BIAS_BEARISH;
+         m_cached.biasStrong = (bM15 == BIAS_BEARISH);
       }
-      else if(bH1 == BIAS_BULLISH || bM15 == BIAS_BULLISH) { 
-         m_cached.bias = BIAS_BULLISH; m_cached.biasStrong = false;
+      // H1 has no structural view — use M15 for intraday session bias
+      else if(bM15 == BIAS_BULLISH) {
+         m_cached.bias      = BIAS_BULLISH;
+         m_cached.biasStrong = false;
       }
-      else if(bH1 == BIAS_BEARISH || bM15 == BIAS_BEARISH) { 
-         m_cached.bias = BIAS_BEARISH; m_cached.biasStrong = false;
+      else if(bM15 == BIAS_BEARISH) {
+         m_cached.bias      = BIAS_BEARISH;
+         m_cached.biasStrong = false;
       }
-      else { 
-         m_cached.bias = BIAS_CONFLICT; m_cached.biasStrong = false;
+      else {
+         // Both H1 and M15 are genuinely sideways — no directional edge
+         m_cached.bias      = BIAS_NONE;
+         m_cached.biasStrong = false;
       }
 
       m_cached.volatility = GetVolatility();

@@ -103,8 +103,8 @@ public:
          }
 
          if(touches >= 2 && clusterPrice > curP) {
-            // Add pool
-            if(m_poolCount < ArraySize(m_pools))
+            // Add pool — FIXED: resize only when array is full (>= not <)
+            if(m_poolCount >= ArraySize(m_pools))
                ArrayResize(m_pools, m_poolCount + 10);
             double distPips = MathAbs(clusterPrice - curP) / m_pipSize;
             int age = (int)((TimeCurrent() - oldest) / PeriodSeconds(tf));

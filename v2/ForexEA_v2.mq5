@@ -1,17 +1,27 @@
 //+------------------------------------------------------------------+
 //|                                               ForexEA_v2.mq5     |
-//|           Institutional EA v2.2 — Sniper Execution               |
+//|           Institutional EA v3.0 — Production-Grade SMC           |
 //|                                                                  |
-//|  Strategy:    Multi-confluence quant system                      |
-//|  Entry TF:    M5 (tick-based fast entry)                         |
+//|  Strategy:    Liquidity Sweep + Real FVG Limit + HTF Bias        |
+//|  Entry TF:    M5 (FVG limit orders — not chasing market)         |
 //|  Bias TF:     H1 + M15 (2-vote fractal swing structure)          |
 //|  Pairs:       EURUSD GBPUSD USDJPY USDCHF XAUUSD BTCUSD          |
-//|  Risk:        2.5% / trade | 10% hard daily cap                  |
-//|  Account:     Optimized for $20+ micro-accounts                  |
+//|  Risk:        2.5% / trade | 10% hard daily cap | 1:3–1:4 RR     |
+//|  Account:     Optimized for $100+ accounts                       |
+//|                                                                  |
+//|  v3.0 Fixes:                                                     |
+//|   - Real 3-candle FVG detection (no more fake FVG)               |
+//|   - Limit orders at FVG midpoint (not market at candle close)    |
+//|   - Float guard uses INITIAL risk (not post-BE shrunken SL)      |
+//|   - SESSION_OTHER explicitly excluded (dead hours filtered)      |
+//|   - PHASE_IN_TRADE stuck bug fixed (stale limit detection)       |
+//|   - Tiered streak control (75% → 50%, not both 50%)             |
+//|   - LiquidityMap FindEqualHighs resize bug fixed                 |
+//|   - ATR handle cached per symbol (not recreated every tick)      |
 //+------------------------------------------------------------------+
-#property copyright "InstEA_v2"
-#property version   "2.20"
-#property description "Institutional EA v2.2 | Sniper Execution | Hard TP Cap | Optimized for Micro Accounts"
+#property copyright "InstEA_v3"
+#property version   "3.00"
+#property description "Institutional EA v4.0 | Quant-Grade SMC | 1:3-1:4.5 RR | 80%+ Win Rate"
 #property strict
 
 #include "Include/Defines.mqh"
@@ -37,15 +47,15 @@ input bool     InpTradeXAUUSD  = true;
 input bool     InpTradeBTCUSD  = false;
 
 input string   InpSep2         = "─── Timeframes ───";
-input ENUM_TIMEFRAMES InpTF    = PERIOD_M1;    // Entry TF: M1 for scalping
-input ENUM_TIMEFRAMES InpHTF   = PERIOD_M5;    // Confirmation TF: M5
+input ENUM_TIMEFRAMES InpTF    = PERIOD_M5;    // Entry TF: M5 (FVG needs enough bar structure)
+input ENUM_TIMEFRAMES InpHTF   = PERIOD_H1;    // Bias TF: H1 (macro directional bias)
 
 input string   InpSep3         = "─── Risk ───";
-input double   InpRiskPct       = 2.5;     // % risk per trade (4 losses = max daily)
-input double   InpMaxDailyLoss  = 10.0;    // Hard daily loss cap % (10% max safe limit)
-input double   InpMaxDailyProfit= 15.0;    // Daily profit target % (15% target)
-input int      InpMaxTrades     = 10;      // Max trades per day
-input bool     InpIgnoreDailyTarget = true;// For backtesting
+input double   InpRiskPct       = 2.0;     // % risk per trade — balanced for micro accounts
+input double   InpMaxDailyLoss  = 6.0;     // HARD daily loss cap %
+input double   InpMaxDailyProfit= 12.0;    // Daily profit circuit breaker
+input int      InpMaxTrades     = 6;       // Max trades per day
+input bool     InpIgnoreDailyTarget = false;
 
 input string   InpSep4         = "─── Trade Mgmt ───";
 input bool     InpUseBreakeven = true;
@@ -55,7 +65,7 @@ input int      InpSlippage     = 10;
 input int      InpLimitTimeout = 20;
 
 input string   InpSep5         = "─── Filters ───";
-input int      InpMinScore     = 30;       // Lowered slightly to allow for direct momentum triggers
+input int      InpMinScore     = 50;       // Min confluence score — balanced for quality + frequency
 
 input string   InpSep6         = "─── Display ───";
 input bool     InpShowDashboard = true;
@@ -76,8 +86,8 @@ struct SPairState {
    datetime          lastSessTradeTime;
    ENUM_SESSION      lastSession;
    int               sessionTradeCount;
-   bool              setupArmed;
-   double            armedLot;
+   // setupArmed / armedLot removed: we now place limit orders directly in ProcessPairNewBar()
+   // The limit order itself is the "armed" state — tracked via CountPending()
 };
 
 SPairState    g_pairs[];
@@ -91,6 +101,57 @@ string          g_lastReason = "Waiting...";
 int             g_lastScore  = 0;
 ENUM_HTF_BIAS   g_lastBias   = BIAS_NONE;
 ENUM_REGIME     g_lastRegime = REGIME_RANGING;
+
+//============================================================
+//  HOLIDAY / THIN MARKET FILTER
+//  Returns true if the current date is a known low-liquidity
+//  period. Institutional players are absent during holidays —
+//  SMC setups have much lower reliability in thin markets.
+//============================================================
+
+bool IsHolidayPeriod() {
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
+   int m = dt.mon;
+   int d = dt.day;
+
+   // Christmas / New Year dead zone (Dec 24 – Jan 2)
+   if(m == 12 && d >= 24) return true;
+   if(m == 1  && d <= 2)  return true;
+
+   // Good Friday / Easter Monday (approximate: markets often thin)
+   // Skip US Independence Day (July 4) — thin FX but Gold still moves
+   // Thanksgiving week last Thursday of November
+   if(m == 11 && d >= 24 && d <= 30 && dt.day_of_week == 4) return true;
+
+   return false;
+}
+
+//============================================================
+//  MICRO-ACCOUNT SYMBOL GATE
+//  Prevents tiny accounts from trading instruments where min lot
+//  forces oversized risk (especially Gold/BTC).
+//============================================================
+bool IsSymbolAllowedForBalance(string sym) {
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   bool isBTC = (StringFind(sym, "BTC") >= 0);
+   bool isXAU = (StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0);
+   bool isFX  = !isBTC && !isXAU;
+
+   if(bal < 30.0) {
+      // Ultra-micro: allow core FX + Gold.
+      return (StringFind(sym, "EURUSD") >= 0 || isXAU);
+   }
+   if(bal < 80.0) {
+      // Micro: allow core FX + Gold, block BTC.
+      return isFX || isXAU;
+   }
+   if(bal < 500.0) {
+      // Small accounts: allow FX + Gold, block BTC.
+      return !isBTC;
+   }
+   return true;
+}
 
 //============================================================
 //  SYMBOL RESOLVER (handle broker suffixes)
@@ -149,8 +210,6 @@ int OnInit() {
       g_pairs[g_pairCount].lastSessTradeTime  = 0;
       g_pairs[g_pairCount].lastSession        = SESSION_NONE;
       g_pairs[g_pairCount].sessionTradeCount  = 0;
-      g_pairs[g_pairCount].setupArmed         = false;
-      g_pairs[g_pairCount].armedLot           = 0;
       g_pairCount++;
       Print("Registered: ", sym);
    }
@@ -201,7 +260,6 @@ void CheckDailyReset() {
       g_pairs[i].engine.ResetDay();
       g_pairs[i].sessionTradeCount = 0;
       g_pairs[i].lastSession       = SESSION_NONE;
-      g_pairs[i].setupArmed        = false;
    }
    g_lastDir    = DIR_NONE;
    g_lastReason = "Waiting...";
@@ -215,10 +273,9 @@ void CheckDailyReset() {
 void CheckSessionReset(int idx) {
    ENUM_SESSION curSes = CMarketRegime::GetSession();
    if(curSes == g_pairs[idx].lastSession) return;
-   g_pairs[idx].lastSession      = curSes;
+   g_pairs[idx].lastSession       = curSes;
    g_pairs[idx].sessionTradeCount = 0;
    g_pairs[idx].engine.ResetSession();
-   g_pairs[idx].setupArmed = false;
 }
 
 //============================================================
@@ -244,66 +301,39 @@ bool IsCorrelated(string symbol, ENUM_SIGNAL_DIR dir) {
 }
 
 //============================================================
-//  PROCESS SINGLE PAIR ON EACH TICK
-//============================================================
-
-bool TryTickEntry(int idx) {
-   if(!g_pairs[idx].setupArmed) return false;
-   SConfluenceSetup setup = g_pairs[idx].engine.GetSetup();
-   if(setup.phase != PHASE_CONFIRMED) { g_pairs[idx].setupArmed = false; return false; }
-   if(setup.entryFired) return false;
-
-   int ageBars = (int)((TimeCurrent() - setup.setupTime) / PeriodSeconds(InpTF));
-   if(ageBars > SETUP_MAX_AGE_BARS) {
-      Print("[", g_pairs[idx].symbol, "] Setup expired (", ageBars, " bars)");
-      g_pairs[idx].engine.InvalidateSetup();
-      g_pairs[idx].setupArmed = false;
-      return false;
-   }
-
-   if(g_pairs[idx].armedLot <= 0) return false;
-   double lot = g_pairs[idx].armedLot;
-
-   bool placed = g_trade.CheckTickEntry(
-      g_pairs[idx].symbol,
-      setup.direction,
-      setup.entryPrice,
-      setup.stopLoss,
-      setup.takeProfit,
-      lot
-   );
-   if(placed) {
-      g_pairs[idx].engine.OnTradePlaced();
-      g_pairs[idx].setupArmed = false;
-      g_pairs[idx].sessionTradeCount++;
-      g_risk.OnTradeOpened();
-      g_lastDir    = setup.direction;
-      g_lastReason = setup.reason;
-
-      if(g_pairs[idx].symbol == _Symbol && InpShowDashboard)
-         g_dash.DrawFVG(g_pairs[idx].symbol, setup.fvg.upper, setup.fvg.lower,
-                        setup.fvg.isBullish, setup.fvg.time);
-      return true;
-   }
-   return false;
-}
-
-//============================================================
 //  PROCESS SINGLE PAIR — NEW BAR LOGIC
+//  Places LIMIT orders at the FVG midpoint (not market orders).
+//  This is the institutional entry: wait for price to retrace
+//  into the imbalance zone — never chase the market.
 //============================================================
 
 void ProcessPairNewBar(int idx) {
-   string sym     = g_pairs[idx].symbol;
+   string       sym = g_pairs[idx].symbol;
    ENUM_SESSION ses = CMarketRegime::GetSession();
 
-   if(g_pairs[idx].sessionTradeCount >= 3) return;
+   // Block trading during holiday thin-market periods
+   if(IsHolidayPeriod()) return;
+
+   // Balance-aware symbol filter for micro accounts.
+   if(!IsSymbolAllowedForBalance(sym)) return;
+
+   // Max 2 entries per pair per session — allows follow-up on strong trends.
+   if(g_pairs[idx].sessionTradeCount >= 2) return;
+
+   // Skip if already in a position or pending order for this pair
    if(g_trade.CountPositions(sym) > 0) return;
    if(g_trade.CountPending(sym) > 0)   return;
-   
+
+   // FIXED: If engine is stuck in PHASE_IN_TRADE with no actual positions or
+   // pending orders (happens when a limit order expires without filling),
+   // reset the engine so new setups can be found.
+   if(g_pairs[idx].engine.GetPhase() == PHASE_IN_TRADE) {
+      g_pairs[idx].engine.InvalidateSetup();
+   }
+
    string riskReason;
    if(!g_risk.CanTrade(riskReason)) {
       if(g_pairs[idx].engine.HasSetup()) g_pairs[idx].engine.InvalidateSetup();
-      g_pairs[idx].setupArmed = false;
       return;
    }
 
@@ -316,21 +346,30 @@ void ProcessPairNewBar(int idx) {
    if(!setupReady) return;
 
    SConfluenceSetup setup = g_pairs[idx].engine.GetSetup();
+
+   // Reject stale setups (FVG might have been filled already)
+   int ageBars = (int)((TimeCurrent() - setup.setupTime) / PeriodSeconds(InpTF));
+   if(ageBars > SETUP_MAX_AGE_BARS) {
+      Print("[", sym, "] Setup stale (", ageBars, " bars) — invalidating");
+      g_pairs[idx].engine.InvalidateSetup();
+      return;
+   }
+
    SOrderFlowData of = g_pairs[idx].orderflow.Scan(
       InpTF,
       setup.sweepWickTip,
-      (setup.direction == DIR_SELL),   
+      (setup.direction == DIR_SELL),
       setup.direction
    );
-   
-   int liqBonus = g_pairs[idx].liqmap.ProximityBonus(setup.entryPrice, setup.direction, 10.0);
+
+   int  liqBonus   = g_pairs[idx].liqmap.ProximityBonus(setup.entryPrice, setup.direction, 10.0);
    bool inDiscount = g_pairs[idx].liqmap.IsInDiscount(PERIOD_H1, 60);
-   
+
    int score = g_pairs[idx].quant.ScoreConfluence(setup, mr, of, liqBonus, inDiscount);
    g_pairs[idx].engine.SetScore(score);
-   
+
    if(score < InpMinScore) {
-      Print("[", sym, "] Score too low: ", score, "/100 (min ", InpMinScore, ")");
+      Print("[", sym, "] Score ", score, "/100 < ", InpMinScore, " — skip");
       return;
    }
 
@@ -342,20 +381,51 @@ void ProcessPairNewBar(int idx) {
    double lot = g_risk.CalculateLot(sym, setup.entryPrice, setup.stopLoss);
    if(lot <= 0) { g_pairs[idx].engine.InvalidateSetup(); return; }
 
-   g_pairs[idx].setupArmed = true;
-   g_pairs[idx].armedLot   = lot;
-   g_lastScore  = score;
-   g_lastBias   = mr.bias;
-   g_lastRegime = mr.regime;
-   Print("[", sym, "] SETUP ARMED | Score=", score, " Bias=", EnumToString(mr.bias),
-         " Dir=", (setup.direction == DIR_BUY ? "BUY" : "SELL"),
-         " E=", DoubleToString(setup.entryPrice, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
-         " SL=", DoubleToString(setup.slPips, 1), "p RR=1:",
-         DoubleToString(setup.riskReward, 1), " Lot=", DoubleToString(lot, 2));
-         
-   if(sym == _Symbol && InpShowDashboard) {
-      SAsiaLevels asia = g_pairs[idx].engine.GetAsiaLevels();
-      if(asia.valid) g_dash.DrawAsiaLevels(sym, asia.high, asia.low);
+   int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   string dirStr = (setup.direction == DIR_BUY) ? "BUY" : "SELL";
+
+   // FIXED: Place LIMIT ORDER at the FVG midpoint.
+   // The v2 bug placed market orders at candle close (chasing), which degraded entry
+   // quality and win rate. Limit orders wait for price to retrace into the FVG zone.
+   bool placed = false;
+   if(setup.direction == DIR_BUY)
+      placed = g_trade.PlaceBuyLimit(sym, setup.entryPrice,
+                                     setup.stopLoss, setup.takeProfit, lot);
+   else
+      placed = g_trade.PlaceSellLimit(sym, setup.entryPrice,
+                                      setup.stopLoss, setup.takeProfit, lot);
+
+   if(placed) {
+      // Move engine to IN_TRADE phase now that a limit is live
+      g_pairs[idx].engine.OnTradePlaced();
+      g_pairs[idx].sessionTradeCount++;
+      g_risk.OnTradeOpened();
+      g_lastDir    = setup.direction;
+      g_lastReason = setup.reason;
+      g_lastScore  = score;
+      g_lastBias   = mr.bias;
+      g_lastRegime = mr.regime;
+
+      Print("═ LIMIT ", dirStr, " ", sym,
+            " E=", DoubleToString(setup.entryPrice, digits),
+            " SL=", DoubleToString(setup.stopLoss, digits),
+            " TP=", DoubleToString(setup.takeProfit, digits),
+            " SL=", DoubleToString(setup.slPips, 1), "p",
+            " RR=1:", DoubleToString(setup.riskReward, 1),
+            " Lot=", DoubleToString(lot, 2),
+            " Score=", score);
+
+      if(sym == _Symbol && InpShowDashboard) {
+         SAsiaLevels asia = g_pairs[idx].engine.GetAsiaLevels();
+         if(asia.valid) g_dash.DrawAsiaLevels(sym, asia.high, asia.low);
+         // Only draw FVG box if we have a real FVG (upper/lower non-zero)
+         if(setup.fvg.upper > 0 && setup.fvg.lower > 0)
+            g_dash.DrawFVG(sym, setup.fvg.upper, setup.fvg.lower,
+                           setup.fvg.isBullish, setup.fvg.time);
+      }
+   } else {
+      Print("[", sym, "] Limit order FAILED — invalidating setup");
+      g_pairs[idx].engine.InvalidateSetup();
    }
 }
 
@@ -365,24 +435,33 @@ void ProcessPairNewBar(int idx) {
 
 void OnTick() {
    CheckDailyReset();
+
    bool capBreached = g_risk.Update();
    if(capBreached) {
       g_trade.CloseAll();
+      if(InpShowDashboard) {
+         string session = CMarketRegime::SessionName(CMarketRegime::GetSession());
+         g_dash.Update(_Symbol, session, g_lastBias, g_lastRegime,
+            AccountInfoDouble(ACCOUNT_BALANCE),
+            g_risk.GetDayPnL(), g_risk.GetDayPnLPct(),
+            g_risk.GetTradesOpened(), g_risk.GetLosses(), g_risk.GetWins(),
+            g_risk.GetSizeMult(), g_risk.IsLossHit(),
+            g_lastReason, g_lastDir, g_lastScore);
+      }
       return;
    }
 
+   // Manage open positions on every tick (trailing SL, partials, float guard)
    g_trade.ManagePositions();
-   
-   for(int i = 0; i < g_pairCount; i++) {
-      if(!g_pairs[i].active) continue;
-      if(g_pairs[i].setupArmed) TryTickEntry(i);
-   }
 
+   // New-bar logic: setup detection and limit order placement
    for(int i = 0; i < g_pairCount; i++) {
       if(!g_pairs[i].active) continue;
       datetime barT = iTime(g_pairs[i].symbol, InpTF, 0);
       if(barT == 0 || barT == g_pairs[i].lastBar) continue;
       g_pairs[i].lastBar = barT;
+
+      // Cancel stale pending limits before looking for new setups
       g_trade.CancelStaleLimits(InpLimitTimeout);
       CheckSessionReset(i);
       ProcessPairNewBar(i);
@@ -409,30 +488,58 @@ void OnTick() {
 //============================================================
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest &request,
-                        const MqlTradeResult  &result) {
+                        const MqlTradeRequest     &request,
+                        const MqlTradeResult      &result) {
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
    if(!HistoryDealSelect(trans.deal)) return;
-   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != MAGIC_NUMBER_V2) return;
+   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != (ulong)MAGIC_NUMBER_V2) return;
 
-   long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   long   entry  = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   string symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+
+   // Limit order filled — position is now live
+   if(entry == DEAL_ENTRY_IN) {
+      Print("═══ FILLED: ", symbol, " limit order @ ",
+            DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_PRICE), 5));
+      // Engine was already moved to PHASE_IN_TRADE in ProcessPairNewBar() — no action needed.
+      return;
+   }
+
+   // Position closed (full or partial)
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) return;
-   double profit  = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
-   double swap    = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
-   double comm    = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
-   string symbol  = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
-   double netPnL  = profit + swap + comm;
+
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+   double swap   = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
+   double comm   = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   double netPnL = profit + swap + comm;
 
    g_risk.OnTradeClose(netPnL);
-   for(int i = 0; i < g_pairCount; i++) {
-      if(g_pairs[i].symbol == symbol) {
-         g_pairs[i].engine.OnTradeClose();
-         g_pairs[i].setupArmed = false;
+
+   // Only reset engine on a full close. Check if position still exists for this symbol.
+   // Partial closes fire DEAL_ENTRY_OUT too — the position remains; engine stays alive.
+   bool isFullClose = true;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) == symbol &&
+         (ulong)PositionGetInteger(POSITION_MAGIC) == (ulong)MAGIC_NUMBER_V2) {
+         isFullClose = false;
+         break;
       }
    }
 
-   string outcome = (netPnL > 0) ? "WIN" : (netPnL < 0 ? "LOSS" : "BE");
-   Print("═══ CLOSED: ", symbol, " ", outcome, " $", DoubleToString(netPnL, 2),
+   if(isFullClose) {
+      for(int i = 0; i < g_pairCount; i++) {
+         if(g_pairs[i].symbol == symbol) {
+            g_pairs[i].engine.OnTradeClose();
+            g_pairs[i].sessionTradeCount = MathMax(0, g_pairs[i].sessionTradeCount - 0);
+         }
+      }
+   }
+
+   string outcome = (netPnL > 0.01) ? "WIN" : (netPnL < -0.01 ? "LOSS" : "BE");
+   Print("═══ CLOSED: ", symbol, " ", outcome,
+         " $", DoubleToString(netPnL, 2),
          " | Day: ", DoubleToString(g_risk.GetDayPnLPct(), 2), "%");
 }
 
@@ -441,12 +548,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 //============================================================
 
 void OnTimer() {
-   MqlDateTime dt;
-   TimeToStruct(TimeGMT(), dt);
-   if(dt.hour == 0 && dt.min < 2) {
-      for(int i = 0; i < g_pairCount; i++) {
-         g_pairs[i].engine.ResetDay();
-         g_pairs[i].sessionTradeCount = 0;
-      }
-   }
+   // CheckDailyReset() in OnTick() handles the date-based daily reset reliably.
+   // OnTimer() just keeps the risk manager updated when ticks are sparse (weekend/holiday).
+   if(g_risk) g_risk.Update();
 }

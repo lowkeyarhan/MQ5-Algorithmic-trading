@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                               RiskManager.mqh   |
-//|      Institutional EA v2 — Risk Management                      |
+//|      Institutional EA v3 — Risk Management                      |
 //|  Hard 10% daily loss cap (realized+floating). Dynamic lot       |
 //|  sizing. Streak control. Kelly criterion sanity cap.            |
 //+------------------------------------------------------------------+
@@ -65,8 +65,8 @@ private:
    }
 
 public:
-   CRiskManager(double riskPct = 1.5, double maxDailyLoss = 10.0,
-                double maxDailyProfit = 20.0, int maxTrades = 8,
+   CRiskManager(double riskPct = 3.0, double maxDailyLoss = 10.0,
+                double maxDailyProfit = 15.0, int maxTrades = 8,
                 bool ignoreDailyTarget = false, ulong magic = MAGIC_NUMBER_V2) {
       m_magic             = magic;
       m_ignoreDailyTarget = ignoreDailyTarget;
@@ -107,10 +107,14 @@ public:
          return true; // caller must close all positions
       }
 
-      double realPct = (m_realizedPnL / m_dayStartBalance) * 100.0;
-      if(!m_dailyTargetHit && realPct >= m_params.maxDailyProfitPct) {
+      // FIXED: Profit target checks TOTAL equity (realized + floating), same as loss cap.
+      // This prevents placing new limit orders when floating P&L already crosses 15%,
+      // not just after those positions close. Existing running positions are NOT closed —
+      // they continue to trail to TP. Only new entries are blocked.
+      if(!m_dailyTargetHit && totalPct >= m_params.maxDailyProfitPct) {
          m_dailyTargetHit = true;
-         Print("[Risk] Daily profit target hit: +", DoubleToString(realPct, 2), "%");
+         Print("[Risk] Daily profit target hit: +", DoubleToString(totalPct, 2),
+               "% — no new entries (existing trades continue)");
       }
 
       return false;
@@ -142,6 +146,7 @@ public:
       double riskAmt  = balance * (m_params.riskPct / 100.0) * m_streak.sizeMult;
       double slDist   = MathAbs(entry - sl);
       if(slDist <= 0) return 0;
+      if(balance <= 0) return 0;
 
       double tickVal  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
       double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -155,6 +160,17 @@ public:
       double maxLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
       double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
       if(lotStep <= 0) lotStep = 0.01;
+      // Effective risk cap for micro accounts:
+      // For micro accounts (< $100), the dynamic cap (riskPct * 1.40) is often
+      // below the minimum lot risk, preventing all trades. Use MAX_LOT_RISK_PCT directly.
+      // For larger accounts, use the tighter dynamic cap.
+      double allowedRiskPct;
+      if(balance < 100.0) {
+         allowedRiskPct = MAX_LOT_RISK_PCT;  // Micro accounts: use ceiling directly
+      } else {
+         double dynamicCapPct = m_params.riskPct * 1.40;
+         allowedRiskPct = MathMin(MAX_LOT_RISK_PCT, dynamicCapPct);
+      }
 
       lot = MathFloor(lot / lotStep) * lotStep;
       lot = MathMin(lot, maxLot);
@@ -162,12 +178,21 @@ public:
       // Micro-account guard: skip if min lot risks > MAX_LOT_RISK_PCT
       if(lot < minLot) {
          double minRisk = (minLot * lossPerLot / balance) * 100.0;
-         if(minRisk > MAX_LOT_RISK_PCT) {
+         if(minRisk > allowedRiskPct) {
             Print("[Risk] SKIP ", symbol, ": min lot (", DoubleToString(minLot,2),
-                  ") would risk ", DoubleToString(minRisk,1), "% (max ", DoubleToString(MAX_LOT_RISK_PCT,1), "%)");
+                  ") would risk ", DoubleToString(minRisk,1), "% (max ", DoubleToString(allowedRiskPct,1), "%)");
             return 0;
          }
          lot = minLot;
+      }
+
+      // Final enforcement after all rounding/clamping.
+      double realRiskPct = (lot * lossPerLot / balance) * 100.0;
+      if(realRiskPct > allowedRiskPct + 0.01) {
+         Print("[Risk] SKIP ", symbol, ": rounded lot ", DoubleToString(lot,2),
+               " risks ", DoubleToString(realRiskPct,2), "% > cap ",
+               DoubleToString(allowedRiskPct,2), "%");
+         return 0;
       }
 
       Print("[Risk] Lot=", DoubleToString(lot,2), " Risk=$", DoubleToString(lot*lossPerLot,2),
@@ -192,15 +217,22 @@ public:
       if(netPnL < 0) {
          m_streak.consecutiveLosses++;
          m_streak.consecutiveWins = 0;
+         // FIXED: Tiered reduction — STREAK_HALF_LOSSES (4 losses) drops to 50%,
+         // STREAK_REDUCE_LOSSES (2 losses) drops to 75%. Previously both were 50%.
          if(m_streak.consecutiveLosses >= STREAK_HALF_LOSSES)
-            m_streak.sizeMult = 0.5;
+            m_streak.sizeMult = STREAK_HALF_MULT;
          else if(m_streak.consecutiveLosses >= STREAK_REDUCE_LOSSES)
-            m_streak.sizeMult = 0.5;
-         Print("[Risk] Loss streak: ", m_streak.consecutiveLosses, " | SizeMult=", DoubleToString(m_streak.sizeMult,2));
+            m_streak.sizeMult = STREAK_REDUCE_MULT;
+         Print("[Risk] Loss streak: ", m_streak.consecutiveLosses,
+               " | SizeMult=x", DoubleToString(m_streak.sizeMult, 2));
       } else if(netPnL > 0) {
          m_streak.consecutiveLosses = 0;
          m_streak.consecutiveWins++;
-         m_streak.sizeMult = 1.0;
+         // Recover size multiplier gradually on wins (avoid sudden jump to 1.0 after a bad streak)
+         if(m_streak.consecutiveWins >= 2)
+            m_streak.sizeMult = 1.0;
+         else if(m_streak.sizeMult < 1.0)
+            m_streak.sizeMult = MathMin(m_streak.sizeMult + 0.25, 1.0);
       }
    }
 

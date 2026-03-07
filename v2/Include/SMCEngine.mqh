@@ -27,6 +27,10 @@ private:
    int              m_shCount;
    int              m_slCount;
 
+   // Session sweep direction: direction of the FIRST confirmed sweep this session.
+   // Used to identify trend-continuation setups and award scoring bonuses.
+   ENUM_SIGNAL_DIR  m_sessionSweepDir;
+
    double PipsToPrice(double pips) { return pips * m_pipSize; }
    double PriceToPips(double d)    { return (m_pipSize > 0) ? d / m_pipSize : 0; }
 
@@ -35,9 +39,89 @@ private:
       ArraySetAsSeries(buf, true);
       int h = iATR(m_symbol, tf, period);
       if(h == INVALID_HANDLE) return 0;
-      int c = CopyBuffer(h, 0, 1, 3, buf);
+      int c = CopyBuffer(h, 0, 1, period + 2, buf);
       IndicatorRelease(h);
       return (c >= 1) ? buf[0] : 0;
+   }
+
+   //==========================================================
+   // REAL 3-CANDLE FVG DETECTION
+   // Bullish FVG: iHigh(i+2) < iLow(i) with strong bullish displacement at i+1
+   // Bearish FVG: iLow(i+2)  > iHigh(i) with strong bearish displacement at i+1
+   //
+   // Requirements tightened for quality:
+   //  - Displacement body >= DISP_ATR_MULT (0.65) × ATR
+   //  - FVG gap itself >= FVG_MIN_SIZE (not a micro-gap)
+   //  - Grade A: body >= 0.75 ATR (strongest impulse)
+   //  - Grade B: body >= 0.55 ATR (still acceptable)
+   //  - Grade C: anything weaker → HARD BLOCK, never trade
+   //==========================================================
+   bool FindFVG(ENUM_SIGNAL_DIR dir, SFVG &fvg) {
+      double atr = GetATR(m_tf, 14);
+      if(atr <= 0) return false;
+      double minDisp    = atr * DISP_ATR_MULT;
+      double minFvgSize = PipsToPrice(m_isGold ? FVG_MIN_SIZE_GOLD :
+                                     (m_isBTC  ? FVG_MIN_SIZE_BTC  : FVG_MIN_SIZE_FX));
+
+      int avail = iBars(m_symbol, m_tf);
+      int scan  = MathMin(FVG_LOOKBACK, avail - 4);
+
+      for(int i = 1; i <= scan; i++) {
+         double hi0 = iHigh(m_symbol, m_tf, i);
+         double lo0 = iLow(m_symbol,  m_tf, i);
+         double cl1 = iClose(m_symbol, m_tf, i + 1);
+         double op1 = iOpen(m_symbol,  m_tf, i + 1);
+         double hi2 = iHigh(m_symbol, m_tf, i + 2);
+         double lo2 = iLow(m_symbol,  m_tf, i + 2);
+
+         if(dir == DIR_BUY) {
+            double dispBody = cl1 - op1;
+            if(hi2 >= lo0)             continue; // no gap
+            if(dispBody <= 0)          continue; // must be bullish
+            if(dispBody < minDisp)     continue; // too weak
+            double gapSize = lo0 - hi2;
+            if(gapSize < minFvgSize)   continue; // FVG too small = noise
+
+            fvg.upper  = lo0;
+            fvg.lower  = hi2;
+            // Enter at the lower 40% of the FVG — better price, wider cushion above
+            fvg.midpoint         = hi2 + gapSize * 0.40;
+            fvg.isBullish        = true;
+            fvg.time             = iTime(m_symbol, m_tf, i + 2);
+            fvg.active           = true;
+            fvg.touchCount       = 0;
+            fvg.displacementBody = dispBody;
+
+            if(dispBody >= atr * 0.75)      fvg.grade = FVG_A;
+            else if(dispBody >= atr * 0.55) fvg.grade = FVG_B;
+            else                            fvg.grade = FVG_C;
+            return true;
+
+         } else { // DIR_SELL
+            double dispBody = op1 - cl1;
+            if(lo2 <= hi0)             continue; // no gap
+            if(dispBody <= 0)          continue; // must be bearish
+            if(dispBody < minDisp)     continue; // too weak
+            double gapSize = lo2 - hi0;
+            if(gapSize < minFvgSize)   continue; // FVG too small
+
+            fvg.upper  = lo2;
+            fvg.lower  = hi0;
+            // Enter at the upper 60% of the FVG — better price for sells
+            fvg.midpoint         = hi0 + gapSize * 0.60;
+            fvg.isBullish        = false;
+            fvg.time             = iTime(m_symbol, m_tf, i + 2);
+            fvg.active           = true;
+            fvg.touchCount       = 0;
+            fvg.displacementBody = dispBody;
+
+            if(dispBody >= atr * 0.75)      fvg.grade = FVG_A;
+            else if(dispBody >= atr * 0.55) fvg.grade = FVG_B;
+            else                            fvg.grade = FVG_C;
+            return true;
+         }
+      }
+      return false;
    }
 
    int DetectGMTOffset() {
@@ -171,7 +255,7 @@ private:
       if(!m_asia.valid) return false;
       double swMin = PipsToPrice(m_isGold ? SWEEP_MIN_GOLD : (m_isBTC ? SWEEP_MIN_BTC : SWEEP_MIN_FX));
       double swMax = PipsToPrice(m_isGold ? SWEEP_MAX_GOLD : (m_isBTC ? SWEEP_MAX_BTC : SWEEP_MAX_FX));
-      for(int i = 1; i <= 5; i++) {
+      for(int i = 1; i <= 5; i++) {  // Scan 5 recent bars for Asia sweep
          double hi = iHigh(m_symbol, m_tf, i);
          double lo = iLow(m_symbol,  m_tf, i);
          double cl = iClose(m_symbol,m_tf, i);
@@ -200,7 +284,10 @@ private:
    bool CheckSwingSweep(ENUM_SIGNAL_DIR &dir, double &wickTip, datetime &sweepTime) {
       double swMin = PipsToPrice(m_isGold ? SWEEP_MIN_GOLD : (m_isBTC ? SWEEP_MIN_BTC : SWEEP_MIN_FX));
       double swMax = PipsToPrice(m_isGold ? SWEEP_MAX_GOLD : (m_isBTC ? SWEEP_MAX_BTC : SWEEP_MAX_FX));
-      int minAge   = SWING_LOOKBACK * 2;
+      // TIGHTENED: swing must be at least SWING_LOOKBACK×4 bars old.
+      // On M5: 6×4 = 24 bars = 2 hours minimum. This ensures we're sweeping a
+      // real structural level, not a 20-minute micro-swing.
+      int minAge   = SWING_LOOKBACK * 4;
       for(int i = 1; i <= 8; i++) { 
          double hi = iHigh(m_symbol, m_tf, i);
          double lo = iLow(m_symbol,  m_tf, i);
@@ -264,22 +351,26 @@ private:
          
       double rr = MathAbs(tp - entry) / slDist;
 
-      m_setup.direction    = dir;
-      m_setup.entryPrice   = entry;
-      m_setup.stopLoss     = sl;
-      m_setup.takeProfit   = tp;
-      m_setup.riskReward   = rr;
-      m_setup.slPips       = slPips;
-      m_setup.fvg          = fvg;
-      m_setup.sweepWickTip = wickTip;
-      m_setup.session      = ses;
-      m_setup.setupTime    = TimeCurrent();
-      m_setup.lastArmTime  = 0;
-      m_setup.phase        = PHASE_CONFIRMED;
-      m_setup.entryFired   = false;
-      m_setup.confluenceScore = 0; 
-      m_setup.reason       = StringFormat("%s %s SL=%.1fp RR=1:%.1f",
-                              (dir == DIR_BUY ? "BUY" : "SELL"), m_symbol, slPips, rr);
+      m_setup.direction       = dir;
+      m_setup.entryPrice      = entry;
+      m_setup.stopLoss        = sl;
+      m_setup.takeProfit      = tp;
+      m_setup.riskReward      = rr;
+      m_setup.slPips          = slPips;
+      m_setup.fvg             = fvg;
+      m_setup.sweepWickTip    = wickTip;
+      m_setup.session         = ses;
+      m_setup.setupTime       = TimeCurrent();
+      m_setup.lastArmTime     = 0;
+      m_setup.phase           = PHASE_CONFIRMED;
+      m_setup.entryFired      = false;
+      m_setup.confluenceScore = 0;
+      // Snapshot the established session direction BEFORE we update it.
+      // DIR_NONE = this is the first trade of the session (no continuation bonus).
+      // Any other value = prior sweep established the session direction (eligible for +10 bonus).
+      m_setup.sessionSweepDir = m_sessionSweepDir;
+      m_setup.reason          = StringFormat("%s %s SL=%.1fp RR=1:%.1f",
+                                (dir == DIR_BUY ? "BUY" : "SELL"), m_symbol, slPips, rr);
       Print("[", m_symbol, "] SETUP BUILT: ", m_setup.reason);
       return true;
    }
@@ -299,14 +390,21 @@ public:
       m_setup.phase = PHASE_IDLE;
       m_shCount = 0; m_slCount = 0;
       m_lastTradeBar = 0; m_lastSwingUpdate = 0;
+      m_sessionSweepDir = DIR_NONE;
    }
 
    bool Update(ENUM_SESSION session) {
       if(m_setup.phase == PHASE_CONFIRMED) return true;
-      bool activeSession = (session != SESSION_NONE);
 
+      // Always update swings and map Asia levels — regardless of session
       UpdateSwings();
       if(session == SESSION_ASIA) MapAsiaLevels();
+
+      // FIXED: Only seek entries during active Kill Zone sessions.
+      // SESSION_OTHER (dead zones 10-12 GMT, 15+ GMT) is explicitly excluded.
+      bool activeSession = (session == SESSION_LONDON    ||
+                            session == SESSION_NY        ||
+                            session == SESSION_LONDON_NY);
       if(!activeSession) return false;
 
       datetime curBar = iTime(m_symbol, m_tf, 0);
@@ -316,55 +414,49 @@ public:
       }
 
       if(!SpreadOK()) return false;
-      if(!m_asia.valid) MapAsiaLevels();
+      if(!m_asia.valid) MapAsiaLevels(); // fallback map if EA started mid-day
 
+      // Cut off new setups late in NY (avoid holding through session close)
       MqlDateTime dt; TimeToStruct(TimeGMT(), dt);
       if(dt.hour == 14 && dt.min >= 45) return false;
 
       ENUM_SIGNAL_DIR sweepDir = DIR_NONE;
-      double wickTip = 0;
+      double wickTip   = 0;
       datetime sweepTime = 0;
 
       bool swept = CheckAsiaSweep(sweepDir, wickTip, sweepTime);
       if(!swept) swept = CheckSwingSweep(sweepDir, wickTip, sweepTime);
       if(!swept) return false;
 
-      // SNIPER ENTRY LOGIC: Immediate Wick Rejection
-      double op = iOpen(m_symbol, m_tf, 1);
-      double cl = iClose(m_symbol, m_tf, 1);
-      double atr = GetATR(m_tf, 14);
-      
-      SFVG fakeFvg; ZeroMemory(fakeFvg); 
-      
-      if(sweepDir == DIR_BUY && cl > op && (cl - op) > (atr * 0.4)) { 
-          fakeFvg.midpoint = cl; 
-          fakeFvg.grade = FVG_A; 
-          fakeFvg.isBullish = true;
-          fakeFvg.active = true;
-          fakeFvg.time = iTime(m_symbol, m_tf, 1);
-          return BuildSetup(sweepDir, fakeFvg, wickTip, session);
-      }
-      else if(sweepDir == DIR_SELL && cl < op && (op - cl) > (atr * 0.4)) { 
-          fakeFvg.midpoint = cl;
-          fakeFvg.grade = FVG_A;
-          fakeFvg.isBullish = false;
-          fakeFvg.active = true;
-          fakeFvg.time = iTime(m_symbol, m_tf, 1);
-          return BuildSetup(sweepDir, fakeFvg, wickTip, session);
-      }
+      // Require a real 3-candle FVG. No fallback, no momentum-only entries.
+      SFVG fvg;
+      ZeroMemory(fvg);
+      if(!FindFVG(sweepDir, fvg)) return false;
 
-      return false; 
+      // C-grade FVGs are noise — HARD BLOCK.
+      if(fvg.grade == FVG_C) return false;
+
+      bool built = BuildSetup(sweepDir, fvg, wickTip, session);
+      if(built) {
+         if(m_sessionSweepDir == DIR_NONE)
+            m_sessionSweepDir = sweepDir;
+      }
+      return built;
    }
 
    void ResetDay() {
       ZeroMemory(m_asia);
       if(m_setup.phase != PHASE_IN_TRADE)
          m_setup.phase = PHASE_IDLE;
+      m_sessionSweepDir = DIR_NONE; // New day = fresh session direction
    }
 
    void ResetSession() {
       if(m_setup.phase != PHASE_CONFIRMED && m_setup.phase != PHASE_IN_TRADE)
          m_setup.phase = PHASE_IDLE;
+      // Reset session direction so each kill zone builds its own trend context.
+      // London and NY can move in different directions — don't carry over.
+      m_sessionSweepDir = DIR_NONE;
    }
 
    void OnTradePlaced() {
@@ -377,11 +469,15 @@ public:
       m_setup.entryFired = false;
    }
 
-   void InvalidateSetup()  { m_setup.phase = PHASE_IDLE; ZeroMemory(m_setup); m_setup.phase = PHASE_IDLE; }
+   void InvalidateSetup() {
+      ZeroMemory(m_setup);
+      m_setup.phase = PHASE_IDLE;
+   }
 
-   SConfluenceSetup GetSetup()      { return m_setup; }
-   SAsiaLevels      GetAsiaLevels() { return m_asia; }
-   bool             HasSetup()      { return (m_setup.phase == PHASE_CONFIRMED); }
+   SConfluenceSetup  GetSetup()      { return m_setup; }
+   SAsiaLevels       GetAsiaLevels() { return m_asia;  }
+   bool              HasSetup()      { return (m_setup.phase == PHASE_CONFIRMED); }
+   ENUM_SETUP_PHASE  GetPhase()      { return m_setup.phase; }
 
    void SetScore(int score) { m_setup.confluenceScore = score; }
 };

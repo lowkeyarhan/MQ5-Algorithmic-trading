@@ -36,6 +36,8 @@ private:
    bool           m_mgmtP1Done[];
    bool           m_mgmtP2Done[];
    int            m_mgmtTrailPhase[];
+   double         m_mgmtInitRiskUSD[]; // initial risk in USD — never changes after entry
+   double         m_mgmtInitSlDist[];  // FIXED: original SL distance for rMult calculation
    int            m_mgmtCount;
 
    ENUM_ORDER_TYPE_FILLING GetFilling(string sym) {
@@ -88,20 +90,26 @@ private:
          ArrayResize(m_mgmtP1Done,      newSz);
          ArrayResize(m_mgmtP2Done,      newSz);
          ArrayResize(m_mgmtTrailPhase,  newSz);
+         ArrayResize(m_mgmtInitRiskUSD, newSz);
+         ArrayResize(m_mgmtInitSlDist,  newSz);
       }
-      m_mgmtTicket[m_mgmtCount]     = ticket;
-      m_mgmtP1Done[m_mgmtCount]     = false;
-      m_mgmtP2Done[m_mgmtCount]     = false;
-      m_mgmtTrailPhase[m_mgmtCount] = 0; 
+      m_mgmtTicket[m_mgmtCount]      = ticket;
+      m_mgmtP1Done[m_mgmtCount]      = false;
+      m_mgmtP2Done[m_mgmtCount]      = false;
+      m_mgmtTrailPhase[m_mgmtCount]  = 0;
+      m_mgmtInitRiskUSD[m_mgmtCount] = 0;  // populated on first ManagePositions pass
+      m_mgmtInitSlDist[m_mgmtCount]  = 0;  // populated on first ManagePositions pass
       return m_mgmtCount++;
    }
 
-   double GetATR(string sym, ENUM_TIMEFRAMES tf, int period = 14) {
+   // FIXED: ATR is now fetched once per ManagePositions() call per symbol
+   // and passed in, preventing handle create/release on every tick × every position.
+   double FetchATR(string sym, ENUM_TIMEFRAMES tf, int period = 14) {
       double buf[];
       ArraySetAsSeries(buf, true);
       int h = iATR(sym, tf, period);
       if(h == INVALID_HANDLE) return 0;
-      int c = CopyBuffer(h, 0, 1, 3, buf);
+      int c = CopyBuffer(h, 0, 1, period + 2, buf);
       IndicatorRelease(h);
       return (c >= 1) ? buf[0] : 0;
    }
@@ -123,10 +131,14 @@ public:
       ArrayResize(m_pending, 30);
 
       m_mgmtCount = 0;
-      ArrayResize(m_mgmtTicket,     30);
-      ArrayResize(m_mgmtP1Done,     30);
-      ArrayResize(m_mgmtP2Done,     30);
-      ArrayResize(m_mgmtTrailPhase, 30);
+      ArrayResize(m_mgmtTicket,      30);
+      ArrayResize(m_mgmtP1Done,      30);
+      ArrayResize(m_mgmtP2Done,      30);
+      ArrayResize(m_mgmtTrailPhase,  30);
+      ArrayResize(m_mgmtInitRiskUSD, 30);
+      ArrayResize(m_mgmtInitSlDist,  30);
+      ArrayInitialize(m_mgmtInitRiskUSD, 0.0);
+      ArrayInitialize(m_mgmtInitSlDist,  0.0);
    }
 
    bool PlaceMarketBuy(string sym, double sl, double tp, double lot) {
@@ -225,6 +237,10 @@ public:
    }
 
    void ManagePositions() {
+      // Cache ATR per symbol within this call to avoid creating/releasing handles on every tick.
+      // Map of symbol → ATR value (simple linear scan, small N).
+      string atrSyms[10]; double atrVals[10]; int atrCnt = 0;
+
       int total = PositionsTotal();
       for(int i = total - 1; i >= 0; i--) {
          ulong ticket = PositionGetTicket(i);
@@ -239,39 +255,61 @@ public:
          double pt    = SymbolInfoDouble(sym, SYMBOL_POINT);
          bool isBuy   = (m_pos.PositionType() == POSITION_TYPE_BUY);
 
-         double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
-         double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
-         double curP  = isBuy ? bid : ask;
+         double bid  = SymbolInfoDouble(sym, SYMBOL_BID);
+         double ask  = SymbolInfoDouble(sym, SYMBOL_ASK);
+         double curP = isBuy ? bid : ask;
+
+         // Use INITIAL SL from open price to anchor risk calculations.
+         // After breakeven, the current SL moves to openP — but we still need
+         // the original SL distance for the float guard.
          double slDist = MathAbs(openP - sl);
          if(slDist <= 0) continue;
 
          double profit = isBuy ? (curP - openP) : (openP - curP);
-         double rMult  = profit / slDist;
 
          SetupForSymbol(sym);
          int mi = EnsureMgmtIdx(ticket);
 
-         //── HARD CAP FAILSAFE (Instant Sell) ──────────────────
-         if(rMult >= TARGET_RR) {
-            Print("[Trade] 🎯 HARD TP REACHED (", DoubleToString(rMult, 2), "R): ", sym, ". Securing bag instantly.");
-            m_trade.PositionClose(ticket);
-            continue; 
+         // FIXED: Store the initial SL distance and risk USD on first encounter.
+         // After breakeven, the live slDist shrinks to ~5pts (the BE buffer),
+         // making rMult artificially huge and triggering premature TP/trailing.
+         if(m_mgmtInitSlDist[mi] <= 0) {
+            m_mgmtInitSlDist[mi] = slDist;
+         }
+         if(m_mgmtInitRiskUSD[mi] <= 0) {
+            double tickVal  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+            double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+            if(tickSize > 0 && tickVal > 0) {
+               m_mgmtInitRiskUSD[mi] = (slDist / tickSize) * tickVal * lots;
+            }
          }
 
-         //── BREAKEVEN ──────────────────────────────
+         // USE ORIGINAL SL DISTANCE for rMult — NOT the live (post-BE) one.
+         double origSlDist = m_mgmtInitSlDist[mi];
+         if(origSlDist <= 0) origSlDist = slDist; // fallback
+         double rMult = profit / origSlDist;
+
+         //── HARD TP FAILSAFE ───────────────────────────────────
+         if(rMult >= TARGET_RR) {
+            Print("[Trade] HARD TP (", DoubleToString(rMult, 2), "R): ", sym);
+            m_trade.PositionClose(ticket);
+            continue;
+         }
+
+         //── BREAKEVEN ──────────────────────────────────────────
          if(m_useBreakeven && rMult >= BE_R_TRIGGER) {
-            double beBuffer = pt * 5;
-            double newSL = isBuy ? NormalizeDouble(openP + beBuffer, digits)
-                                 : NormalizeDouble(openP - beBuffer, digits);
-            bool alreadyBE = isBuy ? (sl >= openP) : (sl <= openP);
+            double beBuffer  = pt * 5;
+            double newSL     = isBuy ? NormalizeDouble(openP + beBuffer, digits)
+                                     : NormalizeDouble(openP - beBuffer, digits);
+            bool alreadyBE   = isBuy ? (sl >= openP) : (sl <= openP);
             if(!alreadyBE) {
                if(m_trade.PositionModify(ticket, newSL, tp))
-                  Print("[Trade] BE @", DoubleToString(rMult,1), "R: ", sym,
+                  Print("[Trade] BE @", DoubleToString(rMult, 1), "R: ", sym,
                         " SL->", DoubleToString(newSL, digits));
             }
          }
 
-         //── PARTIAL 1 ────────────────────
+         //── PARTIAL CLOSE 1 ────────────────────────────────────
          if(m_usePartial && rMult >= PARTIAL1_R && !m_mgmtP1Done[mi]) {
             double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
             double lotStep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
@@ -281,13 +319,14 @@ public:
             if(closeLots < lots) {
                if(m_trade.PositionClosePartial(ticket, closeLots)) {
                   m_mgmtP1Done[mi] = true;
-                  Print("[Trade] PARTIAL1 20% @", DoubleToString(rMult,1), "R: ", sym,
-                        " closed=", DoubleToString(closeLots,2));
+                  Print("[Trade] P1 ", DoubleToString(PARTIAL1_PCT * 100, 0), "% @",
+                        DoubleToString(rMult, 1), "R: ", sym,
+                        " closed=", DoubleToString(closeLots, 2));
                }
             }
          }
 
-         //── PARTIAL 2 ────────────
+         //── PARTIAL CLOSE 2 ────────────────────────────────────
          if(m_usePartial && rMult >= PARTIAL2_R && !m_mgmtP2Done[mi]) {
             double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
             double lotStep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
@@ -297,16 +336,27 @@ public:
             if(closeLots < lots) {
                if(m_trade.PositionClosePartial(ticket, closeLots)) {
                   m_mgmtP2Done[mi] = true;
-                  Print("[Trade] PARTIAL2 30% @", DoubleToString(rMult,1), "R: ", sym,
-                        " closed=", DoubleToString(closeLots,2));
+                  Print("[Trade] P2 ", DoubleToString(PARTIAL2_PCT * 100, 0), "% @",
+                        DoubleToString(rMult, 1), "R: ", sym,
+                        " closed=", DoubleToString(closeLots, 2));
                }
             }
          }
 
-         //── 3-PHASE ADAPTIVE TRAILING SL ──────────────────
+         //── 3-PHASE ADAPTIVE TRAILING SL ───────────────────────
          if(m_useTrail && rMult >= TRAIL_P1_START_R) {
-            double atr = GetATR(sym, PERIOD_M5, 14);
-            if(atr <= 0) atr = slDist;
+            // FIXED: Cache ATR per symbol — avoid creating handle on every tick.
+            double atr = 0;
+            for(int k = 0; k < atrCnt; k++) {
+               if(atrSyms[k] == sym) { atr = atrVals[k]; break; }
+            }
+            if(atr <= 0 && atrCnt < 10) {
+               atr = FetchATR(sym, PERIOD_M5, 14);
+               atrSyms[atrCnt] = sym;
+               atrVals[atrCnt] = atr;
+               atrCnt++;
+            }
+            if(atr <= 0) atr = slDist; // fallback
 
             double trailDist;
             int    newPhase;
@@ -321,35 +371,36 @@ public:
                newPhase  = 1;
             }
 
-            if(newPhase != m_mgmtTrailPhase[mi])
-               Print("[Trade] Trail Phase->P", newPhase, " @", DoubleToString(rMult,1), "R: ", sym);
-            m_mgmtTrailPhase[mi] = newPhase;
+            if(newPhase != m_mgmtTrailPhase[mi]) {
+               Print("[Trade] Trail P", newPhase, " @", DoubleToString(rMult, 1), "R: ", sym);
+               m_mgmtTrailPhase[mi] = newPhase;
+            }
 
             double newSL;
             bool   doTrail = false;
             if(isBuy) {
-               newSL   = NormalizeDouble(curP - trailDist, digits);
-               doTrail = (newSL > sl + pt);
+               newSL    = NormalizeDouble(curP - trailDist, digits);
+               doTrail  = (newSL > sl + pt);
             } else {
-               newSL   = NormalizeDouble(curP + trailDist, digits);
-               doTrail = (newSL < sl - pt);
+               newSL    = NormalizeDouble(curP + trailDist, digits);
+               doTrail  = (newSL < sl - pt);
             }
-
             if(doTrail) {
                if(m_trade.PositionModify(ticket, newSL, tp))
-                  Print("[Trade] Trail P", newPhase, " @", DoubleToString(rMult,1),
-                        "R: ", sym, " SL->", DoubleToString(newSL, digits));
+                  Print("[Trade] Trail P", newPhase, " @", DoubleToString(rMult, 1),
+                        "R ", sym, " SL->", DoubleToString(newSL, digits));
             }
          }
 
-         //── FLOATING LOSS GUARD ──────────────────────────────
-         double floatPnL  = m_pos.Profit() + m_pos.Swap();
-         double tickVal   = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-         double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-         if(tickSize > 0 && tickVal > 0) {
-            double initRisk = (slDist / tickSize) * tickVal * lots;
-            if(floatPnL < -(initRisk * 2.0)) {
-               Print("[Trade] Float guard! ", sym, " P&L=$", DoubleToString(floatPnL,2));
+         //── FLOATING LOSS GUARD (EXTREME SLIPPAGE ONLY) ────────
+         // FIXED: Uses the stored INITIAL risk in USD, not the current SL distance.
+         // Previous bug: after BE the current slDist → 5pts, initRisk → ~$0,
+         // triggering closure on any 1-pip adverse tick.
+         if(m_mgmtInitRiskUSD[mi] > 0) {
+            double floatPnL = m_pos.Profit() + m_pos.Swap();
+            if(floatPnL < -(m_mgmtInitRiskUSD[mi] * 2.5)) {
+               Print("[Trade] FLOAT GUARD (>2.5R loss) ", sym,
+                     " P&L=$", DoubleToString(floatPnL, 2));
                m_trade.PositionClose(ticket);
             }
          }

@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                  Dashboard.mqh  |
-//|       Institutional EA v2 — On-Chart Display & Logging          |
+//|       Institutional EA v3 — On-Chart Display & Logging          |
 //+------------------------------------------------------------------+
 #ifndef DASHBOARD_V2_MQH
 #define DASHBOARD_V2_MQH
